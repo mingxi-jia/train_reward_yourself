@@ -3,3 +3,4 @@ ppo_lift_tensorboard
 *.pyc*
 .vscode/
 __pycache__/
+*.hdf5
