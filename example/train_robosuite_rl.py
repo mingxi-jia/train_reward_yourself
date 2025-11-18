@@ -29,28 +29,47 @@ else:
 # --- 1. NEW: Environment Creation Function ---
 # This function is required for SubprocVecEnv
 
-def get_controller_config(use_osc_position=False):
+def get_controller_config(control_type=None):
     controller_config = load_composite_controller_config(controller="BASIC")
 
-    if use_osc_position:
-        print("Using OSC_POSE controller configuration...")
-        new_config = {
-            "type": "OSC_POSE",
-            "input_max": 1,
-                            "input_min": -1,
-                            "output_max": [0.05, 0.05, 0.05, 0.0, 0.0, 0.5],
-                            "output_min": [-0.05, -0.05, -0.05, 0.0, 0.0, -0.5],
-                            "kp": 150,
-                            "damping_ratio": 1,
-                            "impedance_mode": "fixed",
-                            "kp_limits": [0, 300],
-                            "damping_ratio_limits": [0, 10],
-                            "position_limits": None,
-                            "control_delta": True,
-                            "interpolation": None,
-                            "ramp_ratio": 0.2,
-                            'gripper': {'type': 'GRIP'}
-                            }
+    if control_type is not None:
+        print(f"Using {control_type} controller configuration...")
+        if control_type == "XYZ":
+            new_config = {
+                "type": "OSC_POSITION",
+                "input_max": 1,
+                "input_min": -1,
+                "output_max": [0.05, 0.05, 0.05],
+                "output_min": [-0.05, -0.05, -0.05],
+                "kp": 150,
+                "damping_ratio": 1,
+                "impedance_mode": "fixed",
+                "kp_limits": [0, 300],
+                "damping_ratio_limits": [0, 10],
+                "position_limits": None,
+                "control_delta": True,
+                "interpolation": None,
+                "ramp_ratio": 0.2,
+                'gripper': {'type': 'GRIP'}
+                }
+        elif control_type == "XYZR":
+            new_config = {
+                "type": "OSC_POSE",
+                "input_max": 1,
+                "input_min": -1,
+                "output_max": [0.05, 0.05, 0.05, 0.0, 0.0, 0.5],
+                "output_min": [-0.05, -0.05, -0.05, 0.0, 0.0, -0.5],
+                "kp": 150,
+                "damping_ratio": 1,
+                "impedance_mode": "fixed",
+                "kp_limits": [0, 300],
+                "damping_ratio_limits": [0, 10],
+                "position_limits": None,
+                "control_delta": True,
+                "interpolation": None,
+                "ramp_ratio": 0.2,
+                'gripper': {'type': 'GRIP'}
+                }
         controller_config['body_parts']['right'] = new_config
     else:
         print("Using default BASIC controller configuration...")
@@ -60,13 +79,13 @@ def get_controller_config(use_osc_position=False):
             del controller_config['body_parts'][key]
     return controller_config
 
-def make_robosuite_env(use_osc_position=False):
+def make_robosuite_env(control_type=None):
     """
     Utility function for multiprocessed env.
     Args:
         use_osc_position: If True, use OSC_POSITION (3DOF: X, Y, Z). If False, use default BASIC controller.
     """
-    controller_config = get_controller_config(use_osc_position=use_osc_position)
+    controller_config = get_controller_config(control_type=control_type)
 
     env_config = {
         "env_name": "Lift",
@@ -88,16 +107,16 @@ def make_robosuite_env(use_osc_position=False):
 if __name__ == '__main__':
     # --- Parse command-line arguments ---
     parser = argparse.ArgumentParser(description='Train PPO agent on Robosuite Lift task')
-    parser.add_argument('--use-osc-position', action='store_true', default=False,
-                        help='Use OSC_POSITION controller (3DOF: X, Y, Z only)')
+    parser.add_argument('--controller-type', type=str, default='XYZR',
+                        help='Controller type to use (default: BASIC) choices: BASIC, XYZ, XYZR')
     parser.add_argument('--timesteps', type=int, default=500_000,
                         help='Total training timesteps (default: 500,000)')
     parser.add_argument('--n-envs', type=int, default=None,
                         help='Number of parallel environments (default: num_cpus - 1)')
     args = parser.parse_args()
 
-    print(f"Controller mode: {'OSC_POSITION (3DOF)' if args.use_osc_position else 'BASIC (default)'}")
-    controller_type = "position" if args.use_osc_position else "pose"
+    controller_type = args.controller_type
+    print(f"Selected controller type: {controller_type}")
 
     # --- 2. Create Parallel Environments ---
     # Get number of available CPUs, leave one or two free
@@ -107,14 +126,14 @@ if __name__ == '__main__':
     # Create the vectorized environment using SubprocVecEnv
     # This creates 'n_envs' environments, each in its own CPU process
     try:
-        env = SubprocVecEnv([lambda: make_robosuite_env(use_osc_position=args.use_osc_position) for _ in range(n_envs)])
+        env = SubprocVecEnv([lambda: make_robosuite_env(control_type=controller_type) for _ in range(n_envs)])
     except Exception as e:
         print(f"\n--- ERROR creating SubprocVecEnv ---")
         print(f"{e}")
         print("This can happen on some systems. Trying with 'fork' start method...")
         # 'fork' is less safe but sometimes needed. 'spawn' is default on Win/Mac
         try:
-             env = SubprocVecEnv([lambda: make_robosuite_env(use_osc_position=args.use_osc_position) for _ in range(n_envs)], start_method='fork')
+             env = SubprocVecEnv([lambda: make_robosuite_env(control_type=controller_type) for _ in range(n_envs)], start_method='fork')
         except Exception as e2:
              print(f"Failed again with 'fork': {e2}")
              print("Exiting.")
