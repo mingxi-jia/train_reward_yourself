@@ -4,3 +4,8 @@ ppo_lift_tensorboard
 .vscode/
 __pycache__/
 *.hdf5
+.local
+*_tensorboard
+*.egg-info
+CLAUDE.md
+*.pt

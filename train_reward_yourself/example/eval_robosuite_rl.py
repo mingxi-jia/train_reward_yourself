@@ -4,38 +4,12 @@ import numpy as np
 import warnings
 from stable_baselines3 import PPO
 from stable_baselines3.common.evaluation import evaluate_policy
-from robosuite.wrappers import GymWrapper
-from robosuite.controllers import load_composite_controller_config
+from train_reward_yourself.utils import GymWrapper
+# from robosuite.controllers import load_composite_controller_config
+from train_reward_yourself.utils import get_controller_config
 # Suppress common warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-def get_controller_config(use_osc_position=True):
-    controller_config = load_composite_controller_config(controller="BASIC")
-    if use_osc_position:
-        new_config = {
-                                "type": "OSC_POSITION",
-                                "input_max": 1,
-                                "input_min": -1,
-                                "output_max": [0.05, 0.05, 0.05],
-                                "output_min": [-0.05, -0.05, -0.05],
-                                "kp": 150,
-                                "damping_ratio": 1,
-                                "impedance_mode": "fixed",
-                                "kp_limits": [0, 300],
-                                "damping_ratio_limits": [0, 10],
-                                "position_limits": None,
-                                "control_delta": True,
-                                "interpolation": None,
-                                "ramp_ratio": 0.2,
-                                'gripper': {'type': 'GRIP'}
-                                }
-        controller_config['body_parts']['right'] = new_config
-    # delete other keys if exist
-    for key in list(controller_config['body_parts'].keys()):
-        if key != 'right':
-            del controller_config['body_parts'][key]
-    return controller_config
 
 def create_eval_env(render=True, camera_names=None):
     """
@@ -49,7 +23,7 @@ def create_eval_env(render=True, camera_names=None):
         Wrapped Gym environment
     """
     # Load controller config for operational space control
-    controller_config = get_controller_config(use_osc_position=False)
+    controller_config = get_controller_config()
 
 
     eval_config = {
@@ -58,6 +32,7 @@ def create_eval_env(render=True, camera_names=None):
         "controller_configs": controller_config,  # Use same controller config
         "has_renderer": render,
         "has_offscreen_renderer": False,
+        "render_camera": "frontview",  # Set default camera view
         "use_camera_obs": False,
         "use_object_obs": True,
         "control_freq": 20,
@@ -134,6 +109,9 @@ def evaluate_model(model_path, n_episodes=10, render=True, verbose=True):
             done = terminated or truncated
             episode_reward += reward
             episode_length += 1
+
+            if render:
+                eval_env.render()
 
         episode_rewards.append(episode_reward)
         episode_lengths.append(episode_length)
@@ -216,6 +194,9 @@ def rollout_episodes(model_path, n_episodes=5, render=True, save_video=False):
             total_reward += reward
             steps += 1
 
+            if render:
+                eval_env.render()
+
         print(f"Episode {episode+1} finished: Reward = {total_reward:.2f}, Steps = {steps}")
 
     eval_env.close()
@@ -228,7 +209,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Evaluate trained RL policy on Robosuite Lift task')
     parser.add_argument('--model', type=str, default='ppo_lift_model',
                         help='Path to saved model (without .zip extension)')
-    parser.add_argument('--episodes', type=int, default=10,
+    parser.add_argument('--episodes', type=int, default=1,
                         help='Number of evaluation episodes')
     parser.add_argument('--no-render', action='store_true',
                         help='Disable rendering (faster evaluation)')

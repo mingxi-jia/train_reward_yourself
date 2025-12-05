@@ -7,10 +7,10 @@ import argparse
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3 import PPO
 from stable_baselines3.common.evaluation import evaluate_policy
-from robosuite.wrappers import GymWrapper
+from train_reward_yourself.utils import GymWrapper
 # --- FIX: Handle controller imports for different robosuite versions ---
-from robosuite.controllers import load_composite_controller_config
-
+# from robosuite.controllers import load_composite_controller_config
+from train_reward_yourself.utils import get_controller_config, make_robosuite_env
 # --- Explicitly import the controller class to register it ---
 try:
     from robosuite.controllers.operational_space_controller import OperationalSpaceController
@@ -29,93 +29,22 @@ else:
 # --- 1. NEW: Environment Creation Function ---
 # This function is required for SubprocVecEnv
 
-def get_controller_config(control_type=None):
-    controller_config = load_composite_controller_config(controller="BASIC")
 
-    if control_type is not None:
-        print(f"Using {control_type} controller configuration...")
-        if control_type == "XYZ":
-            new_config = {
-                "type": "OSC_POSITION",
-                "input_max": 1,
-                "input_min": -1,
-                "output_max": [0.05, 0.05, 0.05],
-                "output_min": [-0.05, -0.05, -0.05],
-                "kp": 150,
-                "damping_ratio": 1,
-                "impedance_mode": "fixed",
-                "kp_limits": [0, 300],
-                "damping_ratio_limits": [0, 10],
-                "position_limits": None,
-                "control_delta": True,
-                "interpolation": None,
-                "ramp_ratio": 0.2,
-                'gripper': {'type': 'GRIP'}
-                }
-        elif control_type == "XYZR":
-            new_config = {
-                "type": "OSC_POSE",
-                "input_max": 1,
-                "input_min": -1,
-                "output_max": [0.05, 0.05, 0.05, 0.0, 0.0, 0.5],
-                "output_min": [-0.05, -0.05, -0.05, 0.0, 0.0, -0.5],
-                "kp": 150,
-                "damping_ratio": 1,
-                "impedance_mode": "fixed",
-                "kp_limits": [0, 300],
-                "damping_ratio_limits": [0, 10],
-                "position_limits": None,
-                "control_delta": True,
-                "interpolation": None,
-                "ramp_ratio": 0.2,
-                'gripper': {'type': 'GRIP'}
-                }
-        controller_config['body_parts']['right'] = new_config
-    else:
-        print("Using default BASIC controller configuration...")
-    # delete other keys if exist
-    for key in list(controller_config['body_parts'].keys()):
-        if key != 'right':
-            del controller_config['body_parts'][key]
-    return controller_config
-
-def make_robosuite_env(control_type=None):
-    """
-    Utility function for multiprocessed env.
-    Args:
-        use_osc_position: If True, use OSC_POSITION (3DOF: X, Y, Z). If False, use default BASIC controller.
-    """
-    controller_config = get_controller_config(control_type=control_type)
-
-    env_config = {
-        "env_name": "Lift",
-        "robots": "Panda",
-        "controller_configs": controller_config,  # Use custom 4DOF controller
-        "has_renderer": False,
-        "has_offscreen_renderer": False,
-        "use_camera_obs": False,
-        "use_object_obs": True,
-        "control_freq": 20,
-        "horizon": 200,
-        "reward_shaping": True,
-    }
-    env = suite.make(**env_config)
-    env = GymWrapper(env)
-    return env
 
 # --- NEW: Main script must be wrapped in __name__ == '__main__' ---
 if __name__ == '__main__':
     # --- Parse command-line arguments ---
     parser = argparse.ArgumentParser(description='Train PPO agent on Robosuite Lift task')
-    parser.add_argument('--controller-type', type=str, default='XYZR',
+    parser.add_argument('--controller-type', type=str, default='BASIC',
                         help='Controller type to use (default: BASIC) choices: BASIC, XYZ, XYZR')
-    parser.add_argument('--timesteps', type=int, default=500_000,
+    parser.add_argument('--timesteps', type=int, default=5,
                         help='Total training timesteps (default: 500,000)')
     parser.add_argument('--n-envs', type=int, default=None,
                         help='Number of parallel environments (default: num_cpus - 1)')
     args = parser.parse_args()
 
     controller_type = args.controller_type
+    output_name = f"ppo_lift_model_{controller_type}_{args.timesteps}"
     print(f"Selected controller type: {controller_type}")
 
     # --- 2. Create Parallel Environments ---
@@ -160,12 +89,12 @@ if __name__ == '__main__':
     print(f"Starting training ({args.timesteps:,} timesteps)...")
     # This will now run for a meaningful amount of time
     model.learn(total_timesteps=args.timesteps, log_interval=10) # Log every 10 updates
-    model.save(f"ppo_lift_model_{controller_type}_{args.timesteps}")
+    model.save(output_name)
     print("Training finished. Model saved as 'ppo_lift_model.zip'")
     # --- 4. Evaluate the Trained Agent ---
     print("\nEvaluating trained agent with rendering...")
     # For evaluation, we create a single, separate env with the same controller config
-    controller_config = get_controller_config(use_osc_position=args.use_osc_position)
+    controller_config = get_controller_config(controller_type)
 
     eval_config = {
         "env_name": "Lift",
@@ -182,7 +111,7 @@ if __name__ == '__main__':
     eval_env_robosuite = suite.make(**eval_config)
     eval_env = GymWrapper(eval_env_robosuite)
     # Load the saved model
-    model = PPO.load("ppo_lift_model", env=eval_env, device=device)
+    model = PPO.load(output_name, env=eval_env, device=device)
     # Evaluate the agent
     mean_reward, std_reward = evaluate_policy(model, eval_env, n_eval_episodes=10, render=True)
     print(f"\n--- Evaluation Complete ---")
