@@ -101,5 +101,5 @@ python train_reward_yourself/eval_bc_agent.py --model=test.zip --env-name=LunarL
 
 ## PPO with pretrained bc
 ```bash
-python train_reward_yourself/train_rl_agent.py --env-type gym --env-name LunarLander-v3   --algo ppo --timesteps 500000 --pretrain-model ppo_lunar_demo100.zip
+python train_reward_yourself/train_rl_agent.py --env-type gym --env-name LunarLander-v3  --n-envs 4 --algo ppo --timesteps 50000 --pretrain-model ppo_lunar_demo100.zip
 ```

@@ -429,6 +429,8 @@ def main():
                         help="Environment type")
 
     # Training arguments
+    parser.add_argument("--n-demos", type=int, default=100,
+                        help="Number of demonstrations to use (default: 100)")
     parser.add_argument("--batch-size", type=int, default=128,
                         help="Batch size (default: 128)")
     parser.add_argument("--epochs", type=int, default=100,
@@ -464,7 +466,10 @@ def main():
     print("Loading demonstrations...")
     print("="*60)
 
-    full_dataset = DemonstrationDataset(args.data, obs_type=args.obs_type)
+    n_demo = args.n_demos
+    episodes = [f"demo_{i}" for i in range(n_demo)]
+    print(episodes)
+    full_dataset = DemonstrationDataset(args.data, obs_type=args.obs_type, episodes=episodes)
 
     # Split into train/val
     train_size = int(args.train_split * len(full_dataset))
