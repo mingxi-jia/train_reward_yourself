@@ -24,6 +24,7 @@ from typing import Optional
 
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.evaluation import evaluate_policy
+from stable_baselines3.common.callbacks import EvalCallback, CallbackList
 
 # Import shared utilities
 from train_reward_yourself.env_utils import (
@@ -54,6 +55,9 @@ def train_ppo(
     batch_size: int = 64,
     n_epochs: int = 10,
     pretrained_model_path: Optional[str] = None,
+    eval_env = None,
+    eval_freq: int = 0,
+    eval_episodes: int = 10,
 ) -> PPO:
     """
     Train a PPO agent.
@@ -70,6 +74,9 @@ def train_ppo(
         batch_size: Batch size for training
         n_epochs: Number of epochs per update
         pretrained_model_path: Optional path to pretrained model to load
+        eval_env: Optional evaluation environment
+        eval_freq: Evaluation frequency in timesteps (0 to disable)
+        eval_episodes: Number of episodes for evaluation
 
     Returns:
         Trained PPO model
@@ -108,9 +115,27 @@ def train_ppo(
 
     print("\n" + "="*60)
     print(f"Starting PPO training ({total_timesteps:,} timesteps)...")
+    if eval_freq > 0 and eval_env is not None:
+        print(f"Evaluation enabled every {eval_freq:,} timesteps with {eval_episodes} episodes")
     print("="*60)
 
-    model.learn(total_timesteps=total_timesteps, log_interval=10, progress_bar=True)
+    # Setup evaluation callback if enabled
+    callbacks = []
+    if eval_freq > 0 and eval_env is not None:
+        eval_callback = EvalCallback(
+            eval_env,
+            best_model_save_path=f"./best_model_{save_path}",
+            log_path=f"./eval_logs_{save_path}",
+            eval_freq=eval_freq,
+            n_eval_episodes=eval_episodes,
+            deterministic=True,
+            render=False,
+        )
+        callbacks.append(eval_callback)
+        print(f"Best model will be saved to: ./best_model_{save_path}/")
+
+    callback = CallbackList(callbacks) if callbacks else None
+    model.learn(total_timesteps=total_timesteps, log_interval=total_timesteps, progress_bar=True, callback=callback)
 
     model.save(save_path)
     print(f"\nModel saved as '{save_path}.zip'")
@@ -130,6 +155,9 @@ def train_sac(
     learning_starts: int = 1000,
     batch_size: int = 256,
     pretrained_model_path: Optional[str] = None,
+    eval_env = None,
+    eval_freq: int = 0,
+    eval_episodes: int = 10,
 ) -> SAC:
     """
     Train a SAC agent.
@@ -146,6 +174,9 @@ def train_sac(
         learning_starts: Number of steps before training starts
         batch_size: Batch size for training
         pretrained_model_path: Optional path to pretrained model to load
+        eval_env: Optional evaluation environment
+        eval_freq: Evaluation frequency in timesteps (0 to disable)
+        eval_episodes: Number of episodes for evaluation
 
     Returns:
         Trained SAC model
@@ -181,9 +212,27 @@ def train_sac(
 
     print("\n" + "="*60)
     print(f"Starting SAC training ({total_timesteps:,} timesteps)...")
+    if eval_freq > 0 and eval_env is not None:
+        print(f"Evaluation enabled every {eval_freq:,} timesteps with {eval_episodes} episodes")
     print("="*60)
 
-    model.learn(total_timesteps=total_timesteps, log_interval=10, progress_bar=True)
+    # Setup evaluation callback if enabled
+    callbacks = []
+    if eval_freq > 0 and eval_env is not None:
+        eval_callback = EvalCallback(
+            eval_env,
+            best_model_save_path=f"./best_model_{save_path}",
+            log_path=f"./eval_logs_{save_path}",
+            eval_freq=eval_freq,
+            n_eval_episodes=eval_episodes,
+            deterministic=True,
+            render=False,
+        )
+        callbacks.append(eval_callback)
+        print(f"Best model will be saved to: ./best_model_{save_path}/")
+
+    callback = CallbackList(callbacks) if callbacks else None
+    model.learn(total_timesteps=total_timesteps, log_interval=10, progress_bar=True, callback=callback)
 
     model.save(save_path)
     print(f"\nModel saved as '{save_path}.zip'")
@@ -240,6 +289,12 @@ Examples:
   # Train PPO on LunarLander
   python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo ppo --timesteps 500000
 
+  # Train with periodic evaluation every 10k timesteps
+  python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo ppo --timesteps 500000 --eval-freq 10000
+
+  # Train from BC-pretrained model with evaluation
+  python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo ppo --pretrain-model test.zip --timesteps 100000 --eval-freq 5000
+
   # Train SAC on LunarLander with fewer parallel environments
   python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo sac --timesteps 500000 --n-envs 1
 
@@ -289,12 +344,14 @@ Examples:
                         help='Number of steps before SAC training starts (default: 1000)')
 
     # Evaluation arguments
+    parser.add_argument('--eval-freq', type=int, default=0,
+                        help='Evaluate every n timesteps during training (0 to disable, default: 0)')
     parser.add_argument('--eval-episodes', type=int, default=10,
                         help='Number of episodes for evaluation (default: 10)')
     parser.add_argument('--no-eval', action='store_true',
-                        help='Skip evaluation after training')
+                        help='Skip final evaluation after training')
     parser.add_argument('--no-render', action='store_true',
-                        help='Disable rendering during evaluation')
+                        help='Disable rendering during final evaluation')
 
     args = parser.parse_args()
 
@@ -343,6 +400,10 @@ Examples:
     print(f"Number of parallel envs: {args.n_envs}")
     print(f"Learning rate: {args.learning_rate}")
     print(f"Batch size: {args.batch_size}")
+    if args.pretrain_model:
+        print(f"Pretrained model: {args.pretrain_model}")
+    if args.eval_freq > 0:
+        print(f"Evaluation frequency: Every {args.eval_freq:,} timesteps ({args.eval_episodes} episodes)")
     print(f"Random seed: {args.seed}")
     print(f"Device: {device}")
     print("="*60 + "\n")
@@ -360,6 +421,12 @@ Examples:
     policy_type = env_config.get_policy_type(env=env)
     print(f"Selected policy type: {policy_type}")
 
+    # Create evaluation environment if periodic evaluation is enabled
+    eval_env = None
+    if args.eval_freq > 0:
+        print(f"Creating evaluation environment for periodic evaluation...")
+        eval_env = env_config.create_single_env()
+
     # Train the agent
     if args.algo == 'ppo':
         model = train_ppo(
@@ -373,6 +440,9 @@ Examples:
             learning_rate=args.learning_rate,
             batch_size=args.batch_size,
             pretrained_model_path=args.pretrain_model,
+            eval_env=eval_env,
+            eval_freq=args.eval_freq,
+            eval_episodes=args.eval_episodes,
         )
     elif args.algo == 'sac':
         model = train_sac(
@@ -387,7 +457,14 @@ Examples:
             learning_starts=args.learning_starts,
             batch_size=args.batch_size,
             pretrained_model_path=args.pretrain_model,
+            eval_env=eval_env,
+            eval_freq=args.eval_freq,
+            eval_episodes=args.eval_episodes,
         )
+
+    # Close evaluation environment if it was created
+    if eval_env is not None:
+        eval_env.close()
 
     # Close training environment
     env.close()
