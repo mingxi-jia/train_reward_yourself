@@ -197,17 +197,8 @@ def create_vectorized_env(
         raise ValueError(f"Unknown env_type: {env_type}")
 
     # Create vectorized environment
-    try:
-        vec_env = SubprocVecEnv(env_fns)
-    except Exception as e:
-        print(f"\nError creating SubprocVecEnv: {e}")
-        print("Trying with 'fork' start method...")
-        try:
-            vec_env = SubprocVecEnv(env_fns, start_method='fork')
-        except Exception as e2:
-            print(f"Failed again with 'fork': {e2}")
-            print("Falling back to DummyVecEnv (single process)...")
-            vec_env = DummyVecEnv(env_fns)
+    # Use DummyVecEnv for simple environments (faster, less overhead)
+    vec_env = DummyVecEnv(env_fns)
 
     # Apply frame stacking if using images
     if use_image_obs and frame_stack > 1:

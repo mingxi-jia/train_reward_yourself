@@ -27,10 +27,7 @@ from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.callbacks import EvalCallback, CallbackList
 
 # Import shared utilities
-from train_reward_yourself.env_utils import (
-    check_gpu,
-    EnvConfig,
-)
+from train_reward_yourself.env_utils import EnvConfig
 
 # Import panda_gym to register Panda environments (if available)
 try:
@@ -92,8 +89,9 @@ def train_ppo(
         print(f"Policy type: {policy_type}")
         print("="*60)
 
-        # Calculate rollout steps per environment
-        rollout_steps_per_env = 2048 // max(n_envs, 1)
+        # Use standard rollout steps per environment (don't divide by n_envs)
+        # PPO needs enough steps per env to collect meaningful trajectories
+        rollout_steps_per_env = 2048
 
         model = PPO(
             policy_type,
@@ -135,7 +133,7 @@ def train_ppo(
         print(f"Best model will be saved to: ./best_model_{save_path}/")
 
     callback = CallbackList(callbacks) if callbacks else None
-    model.learn(total_timesteps=total_timesteps, log_interval=total_timesteps, progress_bar=True, callback=callback)
+    model.learn(total_timesteps=total_timesteps, log_interval=10, progress_bar=True, callback=callback)
 
     model.save(save_path)
     print(f"\nModel saved as '{save_path}.zip'")
@@ -355,8 +353,9 @@ Examples:
 
     args = parser.parse_args()
 
-    # Check for GPU
-    device = check_gpu()
+    # Force CPU for MlpPolicy (faster than GPU for small networks)
+    device = "cpu"
+    print("Using CPU (faster than GPU for MlpPolicy)")
 
     # Determine number of environments
     if args.n_envs is None:
