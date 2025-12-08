@@ -18,8 +18,10 @@ dependencies = [
     "robomimic @ git+https://github.com/mingxi-jia/robomimic.git@main",
     "robosuite-task-zoo @ git+https://github.com/ARISE-Initiative/robosuite-task-zoo.git",
     "mimicgen @ git+https://github.com/NVlabs/mimicgen.git",
-    "gymnasium",
-    "tensorboard"
+    "gymnasium[box2d]",
+    "tensorboard",
+    "swig>=4.4.0",
+    "imitation",
 ]
 
 [project.optional-dependencies]

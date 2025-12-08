@@ -25,6 +25,9 @@ from typing import Optional
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.evaluation import evaluate_policy
 
+from stable_baselines3.common.callbacks import EvalCallback
+
+
 # Import shared utilities
 from train_reward_yourself.env_utils import (
     check_gpu,
@@ -54,6 +57,7 @@ def train_ppo(
     batch_size: int = 64,
     n_epochs: int = 10,
     pretrained_model_path: Optional[str] = None,
+    eval_env = None,
 ) -> PPO:
     """
     Train a PPO agent.
@@ -85,6 +89,16 @@ def train_ppo(
         print(f"Policy type: {policy_type}")
         print("="*60)
 
+
+        # Create callback that evaluates agent for 5 episodes every 500 training environment steps.
+        # When using multiple training environments, agent will be evaluated every
+        # eval_freq calls to train_env.step(), thus it will be evaluated every
+        # (eval_freq * n_envs) training steps. See EvalCallback doc for more information.
+        eval_callback = EvalCallback(eval_env, best_model_save_path=tensorboard_log,
+                                    log_path=tensorboard_log, eval_freq=100,
+                                    n_eval_episodes=5, deterministic=True,
+                                    render=False)
+
         # Calculate rollout steps per environment
         rollout_steps_per_env = 2048 // max(n_envs, 1)
 
@@ -100,7 +114,7 @@ def train_ppo(
             n_epochs=n_epochs,
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=0.2,
+            clip_range=0.2
         )
 
         print(f"Model created. Training on device: {model.device}")
@@ -110,7 +124,7 @@ def train_ppo(
     print(f"Starting PPO training ({total_timesteps:,} timesteps)...")
     print("="*60)
 
-    model.learn(total_timesteps=total_timesteps, log_interval=10, progress_bar=True)
+    model.learn(total_timesteps=total_timesteps, log_interval=10, progress_bar=True, callback=eval_callback)
 
     model.save(save_path)
     print(f"\nModel saved as '{save_path}.zip'")
@@ -326,6 +340,16 @@ Examples:
         seed=args.seed,
     )
 
+    eval_env_config = EnvConfig(
+        env_type=args.env_type,
+        env_name=args.env_name,
+        control_type=args.control_type if args.env_type == 'robosuite' else None,
+        use_image_obs=args.use_image_obs,
+        image_size=args.image_size,
+        frame_stack=args.frame_stack if args.use_image_obs else 1,
+        seed=args.seed + 42,
+    )
+
     # Print configuration
     print("\n" + "="*60)
     print("RL Training Configuration")
@@ -355,6 +379,7 @@ Examples:
     # Create vectorized environment
     print(f"Creating {args.n_envs} parallel environment(s)...")
     env = env_config.create_vec_env(n_envs=args.n_envs)
+    eval_env = eval_env_config.create_vec_env(n_envs=args.n_envs)
 
     # Get policy type based on environment observation space
     policy_type = env_config.get_policy_type(env=env)
@@ -373,6 +398,7 @@ Examples:
             learning_rate=args.learning_rate,
             batch_size=args.batch_size,
             pretrained_model_path=args.pretrain_model,
+            eval_env = eval_env
         )
     elif args.algo == 'sac':
         model = train_sac(
