@@ -83,7 +83,10 @@ def train_ppo(
         print("Loading pretrained PPO agent...")
         print(f"Pretrained model: {pretrained_model_path}")
         model = PPO.load(pretrained_model_path, env=env, device=device)
+        # Override tensorboard log path to create new logs
+        model.tensorboard_log = tensorboard_log
         print(f"Loaded model. Continuing training on device: {model.device}")
+        print(f"Tensorboard logs will be written to: {tensorboard_log}")
     else:
         print("Creating PPO agent...")
         print(f"Policy type: {policy_type}")
@@ -133,7 +136,15 @@ def train_ppo(
         print(f"Best model will be saved to: ./best_model_{save_path}/")
 
     callback = CallbackList(callbacks) if callbacks else None
-    model.learn(total_timesteps=total_timesteps, log_interval=10, progress_bar=True, callback=callback)
+    # Reset num_timesteps when loading pretrained model to start fresh tensorboard logs
+    reset_timesteps = pretrained_model_path is not None
+    model.learn(
+        total_timesteps=total_timesteps,
+        log_interval=10,
+        progress_bar=True,
+        callback=callback,
+        reset_num_timesteps=reset_timesteps,
+    )
 
     model.save(save_path)
     print(f"\nModel saved as '{save_path}.zip'")
@@ -184,7 +195,10 @@ def train_sac(
         print("Loading pretrained SAC agent...")
         print(f"Pretrained model: {pretrained_model_path}")
         model = SAC.load(pretrained_model_path, env=env, device=device)
+        # Override tensorboard log path to create new logs
+        model.tensorboard_log = tensorboard_log
         print(f"Loaded model. Continuing training on device: {model.device}")
+        print(f"Tensorboard logs will be written to: {tensorboard_log}")
     else:
         print("Creating SAC agent...")
         print(f"Policy type: {policy_type}")
@@ -230,7 +244,15 @@ def train_sac(
         print(f"Best model will be saved to: ./best_model_{save_path}/")
 
     callback = CallbackList(callbacks) if callbacks else None
-    model.learn(total_timesteps=total_timesteps, log_interval=10, progress_bar=True, callback=callback)
+    # Reset num_timesteps when loading pretrained model to start fresh tensorboard logs
+    reset_timesteps = pretrained_model_path is not None
+    model.learn(
+        total_timesteps=total_timesteps,
+        log_interval=10,
+        progress_bar=True,
+        callback=callback,
+        reset_num_timesteps=reset_timesteps,
+    )
 
     model.save(save_path)
     print(f"\nModel saved as '{save_path}.zip'")
@@ -411,6 +433,8 @@ Examples:
     obs_type = "img" if args.use_image_obs else "state"
     save_path = f"{args.algo}_{args.env_name.lower().replace('-', '_')}_{obs_type}_{args.timesteps}"
     tensorboard_log = f"./{args.algo}_{args.env_name.lower().replace('-', '_')}_{obs_type}_tensorboard/"
+    print(f"Model will be saved to: {save_path}.zip")
+    print(f"Tensorboard logs will be saved to: {tensorboard_log}\n")
 
     # Create vectorized environment
     print(f"Creating {args.n_envs} parallel environment(s)...")
@@ -419,6 +443,20 @@ Examples:
     # Get policy type based on environment observation space
     policy_type = env_config.get_policy_type(env=env)
     print(f"Selected policy type: {policy_type}")
+
+    # Convert eval_freq from timesteps to env.step() calls
+    # With vectorized envs, each env.step() call advances n_envs timesteps
+    if args.eval_freq > 0:
+        eval_freq_timesteps = args.eval_freq
+        # Convert timesteps to number of env.step() calls
+        eval_freq_steps = round(args.eval_freq / args.n_envs)
+        eval_freq_steps = max(1, eval_freq_steps)
+        args.eval_freq = eval_freq_steps
+        actual_timesteps = eval_freq_steps * args.n_envs
+        if actual_timesteps != eval_freq_timesteps:
+            print(f"\nNote: eval_freq {eval_freq_timesteps:,} timesteps → {eval_freq_steps:,} env steps = {actual_timesteps:,} timesteps")
+        else:
+            print(f"\neval_freq: {eval_freq_steps:,} env steps = {actual_timesteps:,} timesteps")
 
     # Create evaluation environment if periodic evaluation is enabled
     eval_env = None
