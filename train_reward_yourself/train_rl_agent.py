@@ -376,7 +376,7 @@ Examples:
     args = parser.parse_args()
 
     # Force CPU for MlpPolicy (faster than GPU for small networks)
-    device = "cpu"
+    device = "cpu" if args.algo == 'ppo' and not args.use_image_obs else "cuda"
     print("Using CPU (faster than GPU for MlpPolicy)")
 
     # Determine number of environments

@@ -70,11 +70,24 @@ def make_gym_env(
 
     # Wrap for image observations if requested
     if use_image_obs:
-        from gymnasium.wrappers import ResizeObservation, GrayScaleObservation
+        from gymnasium.wrappers import ResizeObservation
+        from gymnasium.wrappers import GrayscaleObservation
 
-        # Convert to grayscale and resize
-        env = GrayScaleObservation(env, keep_dim=True)
-        env = ResizeObservation(env, shape=(image_size, image_size))
+        # Check if env already returns image observations
+        is_image_obs = len(env.observation_space.shape) == 3
+
+        if not is_image_obs:
+            # Environment returns state, need to use rendered images instead
+            from train_reward_yourself.train_bc_agent import ImageObservationWrapper
+            # Don't normalize for RL (SB3 expects 0-255 uint8)
+            env = ImageObservationWrapper(env, target_shape=(image_size, image_size), frame_stack=1, normalize=False)
+            # Mark that we used custom wrapper (for downstream processing)
+            env._uses_custom_image_wrapper = True
+        else:
+            # Environment already returns images, just convert to grayscale and resize
+            env = GrayscaleObservation(env, keep_dim=True)
+            env = ResizeObservation(env, shape=(image_size, image_size))
+            env._uses_custom_image_wrapper = False
 
     return env
 
@@ -200,12 +213,21 @@ def create_vectorized_env(
     # Use DummyVecEnv for simple environments (faster, less overhead)
     vec_env = DummyVecEnv(env_fns)
 
-    # Apply frame stacking if using images
-    if use_image_obs and frame_stack > 1:
-        print(f"Applying frame stacking: {frame_stack} frames")
-        vec_env = VecFrameStack(vec_env, n_stack=frame_stack)
-        # Transpose images to channel-first format (required by PyTorch CNNs)
-        vec_env = VecTransposeImage(vec_env)
+    # Apply frame stacking and transpose for images
+    # Only if NOT using custom ImageObservationWrapper (which handles this internally)
+    if use_image_obs:
+        # Check if using custom wrapper by testing first env
+        test_env = env_fns[0]()
+        uses_custom_wrapper = getattr(test_env, '_uses_custom_image_wrapper', False)
+        test_env.close()
+
+        if not uses_custom_wrapper and frame_stack > 1:
+            print(f"Applying frame stacking: {frame_stack} frames")
+            vec_env = VecFrameStack(vec_env, n_stack=frame_stack)
+
+        if not uses_custom_wrapper:
+            # Transpose images to channel-first format (required by PyTorch CNNs)
+            vec_env = VecTransposeImage(vec_env)
 
     return vec_env
 
