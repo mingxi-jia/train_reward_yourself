@@ -4,6 +4,7 @@ Train a Behavioral Cloning agent from HDF5 demonstrations.
 
 Supports both state-to-action (MLP) and image-to-action (CNN) mappings.
 The trained model can be used to initialize PPO agents.
+Optionally pretrain the critic (value function) from expert returns.
 
 Usage:
     # Train from state observations
@@ -19,6 +20,16 @@ Usage:
         --obs-type image \
         --env-name LunarLander-v3 \
         --output bc_lunarlander_cnn.zip
+
+    # Train with critic pretraining
+    python -m train_reward_yourself.train_bc_agent \
+        --data demos_lunarlander_v3.hdf5 \
+        --obs-type state \
+        --env-name LunarLander-v3 \
+        --output bc_lunarlander.zip \
+        --pretrain-critic \
+        --gamma 0.99 \
+        --value-loss-coef 0.5
 """
 
 import argparse
@@ -41,17 +52,22 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 class DemonstrationDataset(Dataset):
     """PyTorch dataset for loading demonstrations from HDF5 file."""
 
-    def __init__(self, hdf5_path: str, obs_type: str = "state", episodes: Optional[List[str]] = None):
+    def __init__(self, hdf5_path: str, obs_type: str = "state", episodes: Optional[List[str]] = None,
+                 compute_returns: bool = False, gamma: float = 0.99):
         """
         Args:
             hdf5_path: Path to HDF5 file
             obs_type: Type of observation ("state" or "image")
             episodes: List of episode keys to load. If None, load all.
+            compute_returns: Whether to compute returns for value function training
+            gamma: Discount factor for return calculation
         """
         self.hdf5_path = hdf5_path
         self.obs_type = obs_type
+        self.compute_returns = compute_returns
         self.observations = []
         self.actions = []
+        self.returns = [] if compute_returns else None
 
         with h5py.File(hdf5_path, "r") as f:
             all_episodes = sorted([k for k in f["data"].keys() if k.startswith("demo_")])
@@ -84,13 +100,33 @@ class DemonstrationDataset(Dataset):
                 self.observations.append(obs)
                 self.actions.append(actions)
 
+                # Compute returns if needed
+                if compute_returns:
+                    rewards = np.array(ep_grp["rewards"])
+                    ep_returns = self._compute_episode_returns(rewards, gamma)
+                    self.returns.append(ep_returns)
+
         # Concatenate all episodes
         self.observations = np.concatenate(self.observations, axis=0)
         self.actions = np.concatenate(self.actions, axis=0)
+        if compute_returns:
+            self.returns = np.concatenate(self.returns, axis=0)
 
         print(f"Loaded {len(self.observations)} transitions")
         print(f"Observation shape: {self.observations.shape}")
         print(f"Action shape: {self.actions.shape}")
+        if compute_returns:
+            print(f"Returns shape: {self.returns.shape}")
+            print(f"Returns range: [{self.returns.min():.2f}, {self.returns.max():.2f}]")
+
+    def _compute_episode_returns(self, rewards: np.ndarray, gamma: float) -> np.ndarray:
+        """Compute discounted returns for an episode."""
+        returns = np.zeros_like(rewards)
+        running_return = 0.0
+        for t in reversed(range(len(rewards))):
+            running_return = rewards[t] + gamma * running_return
+            returns[t] = running_return
+        return returns
 
     def __len__(self):
         return len(self.observations)
@@ -113,6 +149,10 @@ class DemonstrationDataset(Dataset):
         else:
             # Continuous action
             action = torch.from_numpy(action).float()
+
+        if self.compute_returns:
+            return_val = torch.tensor(self.returns[idx], dtype=torch.float32)
+            return obs, action, return_val
 
         return obs, action
 
@@ -179,12 +219,14 @@ class BCAgent(nn.Module):
         action_space: gym.Space,
         obs_type: str = "state",
         features_dim: int = 256,
+        train_value_head: bool = False,
     ):
         super().__init__()
 
         self.obs_type = obs_type
         self.action_space = action_space
         self.is_discrete = isinstance(action_space, gym.spaces.Discrete)
+        self.train_value_head = train_value_head
 
         # Feature extractor
         if obs_type == "image":
@@ -198,9 +240,18 @@ class BCAgent(nn.Module):
         else:
             self.action_head = nn.Linear(features_dim, action_space.shape[0])
 
-    def forward(self, obs):
+        # Value head (optional, for critic pretraining)
+        if train_value_head:
+            self.value_head = nn.Linear(features_dim, 1)
+
+    def forward(self, obs, return_value=False):
         features = self.feature_extractor(obs)
         action_logits = self.action_head(features)
+
+        if return_value and self.train_value_head:
+            value = self.value_head(features)
+            return action_logits, value
+
         return action_logits
 
     def predict(self, obs, deterministic=True):
@@ -241,86 +292,155 @@ def train_bc_agent(
     num_epochs: int,
     learning_rate: float,
     device: torch.device,
+    value_loss_coef: float = 0.5,
 ) -> Dict[str, List[float]]:
     """Train the BC agent."""
 
     optimizer = torch.optim.Adam(agent.parameters(), lr=learning_rate)
 
     if agent.is_discrete:
-        criterion = nn.CrossEntropyLoss()
+        policy_criterion = nn.CrossEntropyLoss()
     else:
-        criterion = nn.MSELoss()
+        policy_criterion = nn.MSELoss()
 
-    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+    value_criterion = nn.MSELoss()
+
+    history = {
+        "train_loss": [], "val_loss": [],
+        "train_policy_loss": [], "val_policy_loss": [],
+        "train_value_loss": [], "val_value_loss": [],
+        "train_acc": [], "val_acc": []
+    }
 
     for epoch in range(num_epochs):
         # Training
         agent.train()
         train_loss = 0.0
+        train_policy_loss = 0.0
+        train_value_loss = 0.0
         train_correct = 0
         train_total = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-        for obs, actions in pbar:
-            obs, actions = obs.to(device), actions.to(device)
+        for batch in pbar:
+            if agent.train_value_head:
+                obs, actions, returns = batch
+                obs = obs.to(device)
+                actions = actions.to(device)
+                returns = returns.to(device).unsqueeze(-1)
+            else:
+                obs, actions = batch
+                obs = obs.to(device)
+                actions = actions.to(device)
 
             optimizer.zero_grad()
-            predictions = agent(obs)
+
+            if agent.train_value_head:
+                predictions, values = agent(obs, return_value=True)
+                policy_loss = policy_criterion(predictions, actions) if not agent.is_discrete or predictions.dim() > 1 else policy_criterion(predictions, actions)
+                value_loss = value_criterion(values, returns)
+                loss = policy_loss + value_loss_coef * value_loss
+            else:
+                predictions = agent(obs)
+                policy_loss = policy_criterion(predictions, actions) if not agent.is_discrete or predictions.dim() > 1 else policy_criterion(predictions, actions)
+                loss = policy_loss
+                value_loss = torch.tensor(0.0)
 
             if agent.is_discrete:
-                loss = criterion(predictions, actions)
                 train_correct += (predictions.argmax(dim=-1) == actions).sum().item()
-            else:
-                loss = criterion(predictions, actions)
 
             loss.backward()
             optimizer.step()
 
             train_loss += loss.item()
+            train_policy_loss += policy_loss.item()
+            if agent.train_value_head:
+                train_value_loss += value_loss.item()
             train_total += obs.size(0)
 
-            pbar.set_postfix({"loss": loss.item()})
+            postfix = {"loss": loss.item(), "policy": policy_loss.item()}
+            if agent.train_value_head:
+                postfix["value"] = value_loss.item()
+            pbar.set_postfix(postfix)
 
         avg_train_loss = train_loss / len(train_loader)
+        avg_train_policy_loss = train_policy_loss / len(train_loader)
         history["train_loss"].append(avg_train_loss)
+        history["train_policy_loss"].append(avg_train_policy_loss)
+
+        log_str = f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f} (Policy: {avg_train_policy_loss:.4f}"
+        if agent.train_value_head:
+            avg_train_value_loss = train_value_loss / len(train_loader)
+            history["train_value_loss"].append(avg_train_value_loss)
+            log_str += f", Value: {avg_train_value_loss:.4f}"
+        log_str += ")"
 
         if agent.is_discrete:
             train_acc = train_correct / train_total
             history["train_acc"].append(train_acc)
-            print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}, Train Acc = {train_acc:.4f}")
-        else:
-            print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}")
+            log_str += f", Acc = {train_acc:.4f}"
+
+        print(log_str)
 
         # Validation
         if val_loader is not None:
             agent.eval()
             val_loss = 0.0
+            val_policy_loss = 0.0
+            val_value_loss = 0.0
             val_correct = 0
             val_total = 0
 
             with torch.no_grad():
-                for obs, actions in val_loader:
-                    obs, actions = obs.to(device), actions.to(device)
-                    predictions = agent(obs)
+                for batch in val_loader:
+                    if agent.train_value_head:
+                        obs, actions, returns = batch
+                        obs = obs.to(device)
+                        actions = actions.to(device)
+                        returns = returns.to(device).unsqueeze(-1)
+                    else:
+                        obs, actions = batch
+                        obs = obs.to(device)
+                        actions = actions.to(device)
+
+                    if agent.train_value_head:
+                        predictions, values = agent(obs, return_value=True)
+                        policy_loss = policy_criterion(predictions, actions)
+                        value_loss = value_criterion(values, returns)
+                        loss = policy_loss + value_loss_coef * value_loss
+                    else:
+                        predictions = agent(obs)
+                        policy_loss = policy_criterion(predictions, actions)
+                        loss = policy_loss
+                        value_loss = torch.tensor(0.0)
 
                     if agent.is_discrete:
-                        loss = criterion(predictions, actions)
                         val_correct += (predictions.argmax(dim=-1) == actions).sum().item()
-                    else:
-                        loss = criterion(predictions, actions)
 
                     val_loss += loss.item()
+                    val_policy_loss += policy_loss.item()
+                    if agent.train_value_head:
+                        val_value_loss += value_loss.item()
                     val_total += obs.size(0)
 
             avg_val_loss = val_loss / len(val_loader)
+            avg_val_policy_loss = val_policy_loss / len(val_loader)
             history["val_loss"].append(avg_val_loss)
+            history["val_policy_loss"].append(avg_val_policy_loss)
+
+            log_str = f"         Val Loss = {avg_val_loss:.4f} (Policy: {avg_val_policy_loss:.4f}"
+            if agent.train_value_head:
+                avg_val_value_loss = val_value_loss / len(val_loader)
+                history["val_value_loss"].append(avg_val_value_loss)
+                log_str += f", Value: {avg_val_value_loss:.4f}"
+            log_str += ")"
 
             if agent.is_discrete:
                 val_acc = val_correct / val_total
                 history["val_acc"].append(val_acc)
-                print(f"         Val Loss = {avg_val_loss:.4f}, Val Acc = {val_acc:.4f}")
-            else:
-                print(f"         Val Loss = {avg_val_loss:.4f}")
+                log_str += f", Acc = {val_acc:.4f}"
+
+            print(log_str)
 
     return history
 
@@ -387,9 +507,10 @@ def save_bc_model_for_ppo(
                     verbose=0)
 
     # Copy BC weights to PPO policy network
-    # The feature extractor and action head can be transferred
     bc_state_dict = agent.state_dict()
     ppo_state_dict = ppo_model.policy.state_dict()
+
+    transferred = []
 
     # Map BC keys to PPO keys
     for bc_key in bc_state_dict.keys():
@@ -397,16 +518,25 @@ def save_bc_model_for_ppo(
             ppo_key = bc_key.replace("feature_extractor", "features_extractor")
             if ppo_key in ppo_state_dict:
                 ppo_state_dict[ppo_key] = bc_state_dict[bc_key]
+                transferred.append(f"{bc_key} -> {ppo_key}")
         elif "action_head" in bc_key:
-            # Map to action network (pi_features_extractor is usually the policy head)
             ppo_key = bc_key.replace("action_head", "action_net")
             if ppo_key in ppo_state_dict:
                 ppo_state_dict[ppo_key] = bc_state_dict[bc_key]
+                transferred.append(f"{bc_key} -> {ppo_key}")
+        elif "value_head" in bc_key and agent.train_value_head:
+            ppo_key = bc_key.replace("value_head", "value_net")
+            if ppo_key in ppo_state_dict:
+                ppo_state_dict[ppo_key] = bc_state_dict[bc_key]
+                transferred.append(f"{bc_key} -> {ppo_key}")
 
     ppo_model.policy.load_state_dict(ppo_state_dict, strict=False)
     ppo_model.save(save_path)
 
     print(f"Saved BC model for PPO initialization: {save_path}")
+    print(f"Transferred weights:")
+    for t in transferred:
+        print(f"  {t}")
 
 
 def main():
@@ -440,6 +570,14 @@ def main():
     parser.add_argument("--features-dim", type=int, default=256,
                         help="Feature dimension (default: 256)")
 
+    # Critic pretraining arguments
+    parser.add_argument("--pretrain-critic", action="store_true",
+                        help="Pretrain value function (critic) from expert returns")
+    parser.add_argument("--gamma", type=float, default=0.99,
+                        help="Discount factor for return calculation (default: 0.99)")
+    parser.add_argument("--value-loss-coef", type=float, default=0.5,
+                        help="Coefficient for value loss (default: 0.5)")
+
     # Evaluation arguments
     parser.add_argument("--eval-episodes", type=int, default=10,
                         help="Number of episodes for evaluation (default: 10)")
@@ -464,12 +602,20 @@ def main():
     # Load dataset
     print("\n" + "="*60)
     print("Loading demonstrations...")
+    if args.pretrain_critic:
+        print("Critic pretraining ENABLED")
     print("="*60)
 
     n_demo = args.n_demos
     episodes = [f"demo_{i}" for i in range(n_demo)]
     print(episodes)
-    full_dataset = DemonstrationDataset(args.data, obs_type=args.obs_type, episodes=episodes)
+    full_dataset = DemonstrationDataset(
+        args.data,
+        obs_type=args.obs_type,
+        episodes=episodes,
+        compute_returns=args.pretrain_critic,
+        gamma=args.gamma
+    )
 
     # Split into train/val
     train_size = int(args.train_split * len(full_dataset))
@@ -503,6 +649,7 @@ def main():
         action_space=env.action_space,
         obs_type=args.obs_type,
         features_dim=args.features_dim,
+        train_value_head=args.pretrain_critic,
     ).to(device)
 
     print(f"Agent architecture:")
@@ -520,6 +667,7 @@ def main():
         num_epochs=args.epochs,
         learning_rate=args.lr,
         device=device,
+        value_loss_coef=args.value_loss_coef,
     )
 
     # Evaluate
@@ -553,6 +701,7 @@ def main():
         "model_state_dict": agent.state_dict(),
         "obs_type": args.obs_type,
         "features_dim": args.features_dim,
+        "train_value_head": args.pretrain_critic,
         "history": history,
     }, str(bc_direct_path))
     print(f"Saved BC agent: {bc_direct_path}")
