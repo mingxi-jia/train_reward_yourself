@@ -102,31 +102,34 @@ def test_reward_model(reward_net, env_name):
     print("\nRunning sanity check on learned reward...")
     print(f"{'Step':<6} | {'Env Reward':<12} | {'Learned Reward':<15}")
     print("-" * 40)
-    
+
     reward_net.eval()
-    
+
+    # Get device from reward_net
+    device = next(reward_net.parameters()).device
+
     # Check if we need to one-hot encode discrete actions
     is_discrete = isinstance(env.action_space, gym.spaces.Discrete)
-    
+
     with torch.no_grad():
         for i in range(10):
             action = env.action_space.sample()
             next_obs, env_reward, term, trunc, _ = env.step(action)
             
             # (Shape: 1, Obs_Dim)
-            obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
-            next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32).unsqueeze(0)
-            dones_t = torch.as_tensor([False], dtype=torch.bool)
-            
+            obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
+            next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32).unsqueeze(0).to(device)
+            dones_t = torch.as_tensor([False], dtype=torch.bool).to(device)
+
             # (Shape: 1, Act_Dim)
             if is_discrete:
                 # Create a zero tensor of shape (1, num_actions)
-                act_t = torch.zeros(1, env.action_space.n)
+                act_t = torch.zeros(1, env.action_space.n, device=device)
                 # Set the active index to 1.0
                 act_t[0, action] = 1.0
             else:
                 # For continuous, just add batch dimension
-                act_t = torch.as_tensor(action, dtype=torch.float32).unsqueeze(0)
+                act_t = torch.as_tensor(action, dtype=torch.float32).unsqueeze(0).to(device)
             
             out = reward_net(obs_t, act_t, next_obs_t, dones_t)
             
