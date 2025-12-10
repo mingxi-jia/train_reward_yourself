@@ -24,15 +24,10 @@ from typing import Optional
 
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.evaluation import evaluate_policy
-
-from stable_baselines3.common.callbacks import EvalCallback
-
+from stable_baselines3.common.callbacks import EvalCallback, CallbackList
 
 # Import shared utilities
-from train_reward_yourself.env_utils import (
-    check_gpu,
-    EnvConfig,
-)
+from train_reward_yourself.env_utils import EnvConfig
 
 # Import panda_gym to register Panda environments (if available)
 try:
@@ -58,6 +53,8 @@ def train_ppo(
     n_epochs: int = 10,
     pretrained_model_path: Optional[str] = None,
     eval_env = None,
+    eval_freq: int = 0,
+    eval_episodes: int = 10,
 ) -> PPO:
     """
     Train a PPO agent.
@@ -74,6 +71,9 @@ def train_ppo(
         batch_size: Batch size for training
         n_epochs: Number of epochs per update
         pretrained_model_path: Optional path to pretrained model to load
+        eval_env: Optional evaluation environment
+        eval_freq: Evaluation frequency in timesteps (0 to disable)
+        eval_episodes: Number of episodes for evaluation
 
     Returns:
         Trained PPO model
@@ -83,24 +83,18 @@ def train_ppo(
         print("Loading pretrained PPO agent...")
         print(f"Pretrained model: {pretrained_model_path}")
         model = PPO.load(pretrained_model_path, env=env, device=device)
+        # Override tensorboard log path to create new logs
+        model.tensorboard_log = tensorboard_log
         print(f"Loaded model. Continuing training on device: {model.device}")
+        print(f"Tensorboard logs will be written to: {tensorboard_log}")
     else:
         print("Creating PPO agent...")
         print(f"Policy type: {policy_type}")
         print("="*60)
 
-
-        # Create callback that evaluates agent for 5 episodes every 500 training environment steps.
-        # When using multiple training environments, agent will be evaluated every
-        # eval_freq calls to train_env.step(), thus it will be evaluated every
-        # (eval_freq * n_envs) training steps. See EvalCallback doc for more information.
-        eval_callback = EvalCallback(eval_env, best_model_save_path=tensorboard_log,
-                                    log_path=tensorboard_log, eval_freq=100,
-                                    n_eval_episodes=5, deterministic=True,
-                                    render=False)
-
-        # Calculate rollout steps per environment
-        rollout_steps_per_env = 2048 // max(n_envs, 1)
+        # Use standard rollout steps per environment (don't divide by n_envs)
+        # PPO needs enough steps per env to collect meaningful trajectories
+        rollout_steps_per_env = 2048
 
         model = PPO(
             policy_type,
@@ -114,7 +108,7 @@ def train_ppo(
             n_epochs=n_epochs,
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=0.2
+            clip_range=0.2,
         )
 
         print(f"Model created. Training on device: {model.device}")
@@ -122,9 +116,35 @@ def train_ppo(
 
     print("\n" + "="*60)
     print(f"Starting PPO training ({total_timesteps:,} timesteps)...")
+    if eval_freq > 0 and eval_env is not None:
+        print(f"Evaluation enabled every {eval_freq:,} timesteps with {eval_episodes} episodes")
     print("="*60)
 
-    model.learn(total_timesteps=total_timesteps, log_interval=10, progress_bar=True, callback=eval_callback)
+    # Setup evaluation callback if enabled
+    callbacks = []
+    if eval_freq > 0 and eval_env is not None:
+        eval_callback = EvalCallback(
+            eval_env,
+            best_model_save_path=f"./best_model_{save_path}",
+            log_path=f"./eval_logs_{save_path}",
+            eval_freq=eval_freq,
+            n_eval_episodes=eval_episodes,
+            deterministic=True,
+            render=False,
+        )
+        callbacks.append(eval_callback)
+        print(f"Best model will be saved to: ./best_model_{save_path}/")
+
+    callback = CallbackList(callbacks) if callbacks else None
+    # Reset num_timesteps when loading pretrained model to start fresh tensorboard logs
+    reset_timesteps = pretrained_model_path is not None
+    model.learn(
+        total_timesteps=total_timesteps,
+        log_interval=10,
+        progress_bar=True,
+        callback=callback,
+        reset_num_timesteps=reset_timesteps,
+    )
 
     model.save(save_path)
     print(f"\nModel saved as '{save_path}.zip'")
@@ -144,6 +164,9 @@ def train_sac(
     learning_starts: int = 1000,
     batch_size: int = 256,
     pretrained_model_path: Optional[str] = None,
+    eval_env = None,
+    eval_freq: int = 0,
+    eval_episodes: int = 10,
 ) -> SAC:
     """
     Train a SAC agent.
@@ -160,6 +183,9 @@ def train_sac(
         learning_starts: Number of steps before training starts
         batch_size: Batch size for training
         pretrained_model_path: Optional path to pretrained model to load
+        eval_env: Optional evaluation environment
+        eval_freq: Evaluation frequency in timesteps (0 to disable)
+        eval_episodes: Number of episodes for evaluation
 
     Returns:
         Trained SAC model
@@ -169,7 +195,10 @@ def train_sac(
         print("Loading pretrained SAC agent...")
         print(f"Pretrained model: {pretrained_model_path}")
         model = SAC.load(pretrained_model_path, env=env, device=device)
+        # Override tensorboard log path to create new logs
+        model.tensorboard_log = tensorboard_log
         print(f"Loaded model. Continuing training on device: {model.device}")
+        print(f"Tensorboard logs will be written to: {tensorboard_log}")
     else:
         print("Creating SAC agent...")
         print(f"Policy type: {policy_type}")
@@ -195,9 +224,35 @@ def train_sac(
 
     print("\n" + "="*60)
     print(f"Starting SAC training ({total_timesteps:,} timesteps)...")
+    if eval_freq > 0 and eval_env is not None:
+        print(f"Evaluation enabled every {eval_freq:,} timesteps with {eval_episodes} episodes")
     print("="*60)
 
-    model.learn(total_timesteps=total_timesteps, log_interval=10, progress_bar=True)
+    # Setup evaluation callback if enabled
+    callbacks = []
+    if eval_freq > 0 and eval_env is not None:
+        eval_callback = EvalCallback(
+            eval_env,
+            best_model_save_path=f"./best_model_{save_path}",
+            log_path=f"./eval_logs_{save_path}",
+            eval_freq=eval_freq,
+            n_eval_episodes=eval_episodes,
+            deterministic=True,
+            render=False,
+        )
+        callbacks.append(eval_callback)
+        print(f"Best model will be saved to: ./best_model_{save_path}/")
+
+    callback = CallbackList(callbacks) if callbacks else None
+    # Reset num_timesteps when loading pretrained model to start fresh tensorboard logs
+    reset_timesteps = pretrained_model_path is not None
+    model.learn(
+        total_timesteps=total_timesteps,
+        log_interval=10,
+        progress_bar=True,
+        callback=callback,
+        reset_num_timesteps=reset_timesteps,
+    )
 
     model.save(save_path)
     print(f"\nModel saved as '{save_path}.zip'")
@@ -254,6 +309,12 @@ Examples:
   # Train PPO on LunarLander
   python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo ppo --timesteps 500000
 
+  # Train with periodic evaluation every 10k timesteps
+  python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo ppo --timesteps 500000 --eval-freq 10000
+
+  # Train from BC-pretrained model with evaluation
+  python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo ppo --pretrain-model test.zip --timesteps 100000 --eval-freq 5000
+
   # Train SAC on LunarLander with fewer parallel environments
   python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo sac --timesteps 500000 --n-envs 1
 
@@ -303,17 +364,20 @@ Examples:
                         help='Number of steps before SAC training starts (default: 1000)')
 
     # Evaluation arguments
+    parser.add_argument('--eval-freq', type=int, default=0,
+                        help='Evaluate every n timesteps during training (0 to disable, default: 0)')
     parser.add_argument('--eval-episodes', type=int, default=10,
                         help='Number of episodes for evaluation (default: 10)')
     parser.add_argument('--no-eval', action='store_true',
-                        help='Skip evaluation after training')
+                        help='Skip final evaluation after training')
     parser.add_argument('--no-render', action='store_true',
-                        help='Disable rendering during evaluation')
+                        help='Disable rendering during final evaluation')
 
     args = parser.parse_args()
 
-    # Check for GPU
-    device = check_gpu()
+    # Force CPU for MlpPolicy (faster than GPU for small networks)
+    device = "cpu" if args.algo == 'ppo' and not args.use_image_obs else "cuda"
+    print("Using CPU (faster than GPU for MlpPolicy)")
 
     # Determine number of environments
     if args.n_envs is None:
@@ -340,16 +404,6 @@ Examples:
         seed=args.seed,
     )
 
-    eval_env_config = EnvConfig(
-        env_type=args.env_type,
-        env_name=args.env_name,
-        control_type=args.control_type if args.env_type == 'robosuite' else None,
-        use_image_obs=args.use_image_obs,
-        image_size=args.image_size,
-        frame_stack=args.frame_stack if args.use_image_obs else 1,
-        seed=args.seed + 42,
-    )
-
     # Print configuration
     print("\n" + "="*60)
     print("RL Training Configuration")
@@ -367,6 +421,10 @@ Examples:
     print(f"Number of parallel envs: {args.n_envs}")
     print(f"Learning rate: {args.learning_rate}")
     print(f"Batch size: {args.batch_size}")
+    if args.pretrain_model:
+        print(f"Pretrained model: {args.pretrain_model}")
+    if args.eval_freq > 0:
+        print(f"Evaluation frequency: Every {args.eval_freq:,} timesteps ({args.eval_episodes} episodes)")
     print(f"Random seed: {args.seed}")
     print(f"Device: {device}")
     print("="*60 + "\n")
@@ -375,15 +433,36 @@ Examples:
     obs_type = "img" if args.use_image_obs else "state"
     save_path = f"{args.algo}_{args.env_name.lower().replace('-', '_')}_{obs_type}_{args.timesteps}"
     tensorboard_log = f"./{args.algo}_{args.env_name.lower().replace('-', '_')}_{obs_type}_tensorboard/"
+    print(f"Model will be saved to: {save_path}.zip")
+    print(f"Tensorboard logs will be saved to: {tensorboard_log}\n")
 
     # Create vectorized environment
     print(f"Creating {args.n_envs} parallel environment(s)...")
     env = env_config.create_vec_env(n_envs=args.n_envs)
-    eval_env = eval_env_config.create_vec_env(n_envs=args.n_envs)
 
     # Get policy type based on environment observation space
     policy_type = env_config.get_policy_type(env=env)
     print(f"Selected policy type: {policy_type}")
+
+    # Convert eval_freq from timesteps to env.step() calls
+    # With vectorized envs, each env.step() call advances n_envs timesteps
+    if args.eval_freq > 0:
+        eval_freq_timesteps = args.eval_freq
+        # Convert timesteps to number of env.step() calls
+        eval_freq_steps = round(args.eval_freq / args.n_envs)
+        eval_freq_steps = max(1, eval_freq_steps)
+        args.eval_freq = eval_freq_steps
+        actual_timesteps = eval_freq_steps * args.n_envs
+        if actual_timesteps != eval_freq_timesteps:
+            print(f"\nNote: eval_freq {eval_freq_timesteps:,} timesteps → {eval_freq_steps:,} env steps = {actual_timesteps:,} timesteps")
+        else:
+            print(f"\neval_freq: {eval_freq_steps:,} env steps = {actual_timesteps:,} timesteps")
+
+    # Create evaluation environment if periodic evaluation is enabled
+    eval_env = None
+    if args.eval_freq > 0:
+        print(f"Creating evaluation environment for periodic evaluation...")
+        eval_env = env_config.create_single_env()
 
     # Train the agent
     if args.algo == 'ppo':
@@ -398,7 +477,9 @@ Examples:
             learning_rate=args.learning_rate,
             batch_size=args.batch_size,
             pretrained_model_path=args.pretrain_model,
-            eval_env = eval_env
+            eval_env=eval_env,
+            eval_freq=args.eval_freq,
+            eval_episodes=args.eval_episodes,
         )
     elif args.algo == 'sac':
         model = train_sac(
@@ -413,7 +494,14 @@ Examples:
             learning_starts=args.learning_starts,
             batch_size=args.batch_size,
             pretrained_model_path=args.pretrain_model,
+            eval_env=eval_env,
+            eval_freq=args.eval_freq,
+            eval_episodes=args.eval_episodes,
         )
+
+    # Close evaluation environment if it was created
+    if eval_env is not None:
+        eval_env.close()
 
     # Close training environment
     env.close()
