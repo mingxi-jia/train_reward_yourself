@@ -22,6 +22,8 @@ import numpy as np
 import gymnasium as gym
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
+import pygame
+import time
 
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
@@ -45,6 +47,142 @@ def load_model(model_path: str, algo: str, env):
 
     print(f"Model loaded successfully!")
     return model
+
+
+def collect_human_trajectory(
+    env,
+    max_steps: int = 1000,
+    collect_images: bool = False,
+    image_size: Tuple[int, int] = (84, 84),
+    fps: int = 30,
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[float], List[bool], Dict, Optional[List[np.ndarray]]]:
+    """
+    Collect a single trajectory from human keyboard input.
+
+    Controls for LunarLander:
+        Arrow keys: Left/Right engines
+        Space: Main engine
+        Nothing: Do nothing
+        ESC: Abort episode
+        R: Restart episode
+
+    Args:
+        env: Environment
+        max_steps: Maximum steps per episode
+        collect_images: Whether to collect rendered images
+        image_size: Tuple of (height, width) for resized images
+        fps: Frames per second for rendering
+
+    Returns:
+        Tuple of (observations, actions, rewards, dones, info, images)
+    """
+    import cv2
+
+    pygame.init()
+    screen = pygame.display.set_mode((600, 400))
+    pygame.display.set_caption("Human Demo Collection - Use Arrow Keys and Space")
+    clock = pygame.time.Clock()
+
+    observations = []
+    actions = []
+    rewards = []
+    dones = []
+    images = [] if collect_images else None
+
+    obs, _ = env.reset()
+    observations.append(obs)
+
+    if collect_images:
+        img = env.render()
+        if img is not None:
+            img = cv2.resize(img, (image_size[1], image_size[0]), interpolation=cv2.INTER_AREA)
+            images.append(img)
+
+    done = False
+    step = 0
+    abort = False
+    restart = False
+
+    print("\n" + "="*60)
+    print("HUMAN CONTROL MODE")
+    print("="*60)
+    print("Controls:")
+    print("  Arrow Left:  Fire left engine")
+    print("  Arrow Right: Fire right engine")
+    print("  Space:       Fire main engine")
+    print("  Nothing:     Do nothing")
+    print("  R:           Restart episode")
+    print("  ESC:         Abort episode")
+    print("="*60 + "\n")
+
+    while not done and step < max_steps and not abort:
+        # Get keyboard input
+        action = 0  # Default: do nothing
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                abort = True
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    abort = True
+                if event.key == pygame.K_r:
+                    restart = True
+
+        keys = pygame.key.get_pressed()
+        if keys[pygame.K_LEFT]:
+            action = 1  # Fire left engine
+        elif keys[pygame.K_RIGHT]:
+            action = 3  # Fire right engine
+        elif keys[pygame.K_SPACE]:
+            action = 2  # Fire main engine
+        else:
+            action = 0  # Do nothing
+
+        # Execute action
+        obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+
+        observations.append(obs)
+        actions.append(action)
+        rewards.append(reward)
+        dones.append(done)
+
+        if collect_images:
+            img = env.render()
+            if img is not None:
+                img = cv2.resize(img, (image_size[1], image_size[0]), interpolation=cv2.INTER_AREA)
+                images.append(img)
+
+        # Render to pygame window
+        img = env.render()
+        if img is not None:
+            img_surface = pygame.surfarray.make_surface(np.transpose(img, (1, 0, 2)))
+            img_surface = pygame.transform.scale(img_surface, (600, 400))
+            screen.blit(img_surface, (0, 0))
+            pygame.display.flip()
+
+        clock.tick(fps)
+        step += 1
+
+        if restart:
+            break
+
+    pygame.quit()
+
+    # Remove the last observation (since we have n+1 observations for n actions)
+    observations = observations[:-1]
+    if images is not None and len(images) > 0:
+        images = images[:-1]
+
+    # Return None if aborted
+    if abort:
+        return None, None, None, None, None, None
+
+    # Return None if restarted
+    if restart:
+        return None, None, None, None, None, None
+
+    return observations, actions, rewards, dones, info, images
 
 
 def collect_trajectory(
@@ -130,12 +268,14 @@ def collect_demonstrations(
     max_attempts_per_demo: int = 10,
     collect_images: bool = False,
     image_size: Tuple[int, int] = (84, 84),
+    human_control: bool = False,
+    fps: int = 30,
 ) -> List[Dict]:
     """
     Collect multiple expert demonstrations.
 
     Args:
-        model: Trained RL model
+        model: Trained RL model (None if human_control=True)
         env: Environment (must support render_mode='rgb_array' if collect_images=True)
         n_demos: Number of demonstrations to collect
         deterministic: Whether to use deterministic actions
@@ -143,6 +283,8 @@ def collect_demonstrations(
         max_attempts_per_demo: Maximum attempts to collect each demo with min_reward
         collect_images: Whether to collect rendered images
         image_size: Tuple of (height, width) for resized images
+        human_control: If True, use keyboard for control instead of model
+        fps: Frames per second for human control rendering
 
     Returns:
         List of demonstration dictionaries
@@ -150,8 +292,12 @@ def collect_demonstrations(
     demonstrations = []
 
     print(f"\n{'='*60}")
-    print(f"Collecting {n_demos} expert demonstrations...")
-    print(f"Deterministic: {deterministic}")
+    if human_control:
+        print(f"Collecting {n_demos} HUMAN demonstrations...")
+        print("Use keyboard to control the agent")
+    else:
+        print(f"Collecting {n_demos} expert demonstrations...")
+        print(f"Deterministic: {deterministic}")
     if min_reward is not None:
         print(f"Minimum reward threshold: {min_reward}")
     if collect_images:
@@ -159,19 +305,30 @@ def collect_demonstrations(
         print(f"Image size: {image_size[0]}x{image_size[1]}")
     print(f"{'='*60}\n")
 
-    pbar = tqdm(total=n_demos, desc="Collecting demos")
+    pbar = tqdm(total=n_demos, desc="Collecting demos", disable=human_control)
 
     while len(demonstrations) < n_demos:
         attempts = 0
         demo_collected = False
 
         while not demo_collected and attempts < max_attempts_per_demo:
-            observations, actions, rewards, dones, info, images = collect_trajectory(
-                model, env, deterministic=deterministic,
-                collect_images=collect_images, image_size=image_size
-            )
+            if human_control:
+                observations, actions, rewards, dones, info, images = collect_human_trajectory(
+                    env, collect_images=collect_images, image_size=image_size, fps=fps
+                )
+
+                # Handle abort/restart
+                if observations is None:
+                    print("Episode aborted or restarted, trying again...")
+                    continue
+            else:
+                observations, actions, rewards, dones, info, images = collect_trajectory(
+                    model, env, deterministic=deterministic,
+                    collect_images=collect_images, image_size=image_size
+                )
 
             total_reward = sum(rewards)
+            print(f"Total reward: {total_reward:.2f}")
 
             # Check if demo meets minimum reward threshold
             if min_reward is None or total_reward >= min_reward:
@@ -188,9 +345,14 @@ def collect_demonstrations(
                     demo['images'] = np.array(images)
                 demonstrations.append(demo)
                 demo_collected = True
-                pbar.update(1)
+                if not human_control:
+                    pbar.update(1)
+                else:
+                    print(f"Demo {len(demonstrations)}/{n_demos} collected! Reward: {total_reward:.2f}")
             else:
                 attempts += 1
+                if human_control:
+                    print(f"Reward {total_reward:.2f} below threshold {min_reward}, try again...")
 
         if not demo_collected:
             print(f"\nWarning: Could not collect demo with reward >= {min_reward} "
@@ -207,7 +369,8 @@ def collect_demonstrations(
             if images is not None:
                 demo['images'] = np.array(images)
             demonstrations.append(demo)
-            pbar.update(1)
+            if not human_control:
+                pbar.update(1)
 
     pbar.close()
 
@@ -361,12 +524,16 @@ Examples:
     )
 
     # Model arguments
-    parser.add_argument('--model-path', type=str, required=True,
+    parser.add_argument('--model-path', type=str, default=None,
                         help='Path to the trained model (.zip file)')
-    parser.add_argument('--algo', type=str, required=True, choices=['ppo', 'sac'],
+    parser.add_argument('--algo', type=str, default='ppo', choices=['ppo', 'sac'],
                         help='Algorithm used to train the model')
     parser.add_argument('--vecnormalize-path', type=str, default=None,
                         help='Path to VecNormalize stats (.pkl file) if used during training')
+
+    # Human control
+    parser.add_argument('--human', action='store_true',
+                        help='Use human keyboard control instead of trained agent')
 
     # Environment arguments
     parser.add_argument('--env-type', type=str, required=True, choices=['gym', 'robosuite'],
@@ -397,6 +564,8 @@ Examples:
                         help='Maximum attempts per demo when using --min-reward (default: 10)')
     parser.add_argument('--seed', type=int, default=0,
                         help='Random seed (default: 0)')
+    parser.add_argument('--fps', type=int, default=30,
+                        help='Frames per second for human control rendering (default: 30)')
 
     # Output arguments
     parser.add_argument('--output', type=str, default=None,
@@ -410,9 +579,14 @@ Examples:
 
     args = parser.parse_args()
 
+    # Validation
+    if not args.human and args.model_path is None:
+        parser.error("--model-path is required when not using --human")
+
     # Auto-generate output path if not specified
     if args.output is None:
-        args.output = f"demos_{args.env_name.lower().replace('-', '_')}.hdf5"
+        prefix = "human_demos" if args.human else "demos"
+        args.output = f"{prefix}_{args.env_name.lower().replace('-', '_')}.hdf5"
 
     # Create environment configuration
     env_config = EnvConfig(
@@ -427,10 +601,16 @@ Examples:
 
     # Print configuration
     print("\n" + "="*60)
-    print("Expert Demonstration Collection Configuration")
+    if args.human:
+        print("HUMAN Demonstration Collection Configuration")
+    else:
+        print("Expert Demonstration Collection Configuration")
     print("="*60)
-    print(f"Model path: {args.model_path}")
-    print(f"Algorithm: {args.algo.upper()}")
+    if args.human:
+        print("Control mode: HUMAN (keyboard)")
+    else:
+        print(f"Model path: {args.model_path}")
+        print(f"Algorithm: {args.algo.upper()}")
     print(f"Environment type: {args.env_type}")
     print(f"Environment name: {args.env_name}")
     if args.env_type == 'robosuite':
@@ -440,31 +620,37 @@ Examples:
         print(f"Image size: {args.image_size}x{args.image_size}")
         print(f"Frame stack: {args.frame_stack}")
     print(f"Number of demos: {args.n_demos}")
-    print(f"Deterministic: {args.deterministic}")
+    if not args.human:
+        print(f"Deterministic: {args.deterministic}")
     if args.min_reward is not None:
         print(f"Minimum reward: {args.min_reward}")
         print(f"Max attempts per demo: {args.max_attempts}")
     if args.collect_images:
         print(f"Collect images: Yes")
         print(f"Image size: {args.render_image_size}x{args.render_image_size}")
+    if args.human:
+        print(f"FPS: {args.fps}")
     print(f"Output file: {args.output}")
     print("="*60 + "\n")
 
-    # Create environment with rendering enabled if collecting images
-    render_mode = 'rgb_array' if args.collect_images else None
+    # Create environment with rendering enabled
+    render_mode = 'rgb_array'
     env = env_config.create_single_env(render_mode=render_mode)
 
-    # Load VecNormalize wrapper if provided
-    if args.vecnormalize_path is not None:
-        print(f"Loading VecNormalize stats from: {args.vecnormalize_path}")
-        env = DummyVecEnv([lambda: env])
-        env = VecNormalize.load(args.vecnormalize_path, env)
-        env.training = False
-        env.norm_reward = False
-        print("VecNormalize stats loaded!")
+    # Load model only if not using human control
+    model = None
+    if not args.human:
+        # Load VecNormalize wrapper if provided
+        if args.vecnormalize_path is not None:
+            print(f"Loading VecNormalize stats from: {args.vecnormalize_path}")
+            env = DummyVecEnv([lambda: env])
+            env = VecNormalize.load(args.vecnormalize_path, env)
+            env.training = False
+            env.norm_reward = False
+            print("VecNormalize stats loaded!")
 
-    # Load model
-    model = load_model(args.model_path, args.algo, env)
+        # Load model
+        model = load_model(args.model_path, args.algo, env)
 
     # Collect demonstrations
     image_size = (args.render_image_size, args.render_image_size)
@@ -477,6 +663,8 @@ Examples:
         max_attempts_per_demo=args.max_attempts,
         collect_images=args.collect_images,
         image_size=image_size,
+        human_control=args.human,
+        fps=args.fps,
     )
 
     # Save demonstrations

@@ -19,15 +19,23 @@ Usage:
 import os
 import warnings
 import argparse
+import random
+import numpy as np
+import torch
 import gymnasium as gym
-from typing import Optional
+from typing import Optional, Tuple
+from pathlib import Path
+from datetime import datetime
 
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.callbacks import EvalCallback, CallbackList
+from stable_baselines3.common.callbacks import EvalCallback, CallbackList, BaseCallback
 
 # Import shared utilities
 from train_reward_yourself.env_utils import EnvConfig
+from train_reward_yourself.reward_wrapper import VecLearnedRewardWrapper
+from train_reward_yourself.vip_reward_wrapper import VIPRewardWrapper, extract_expert_goals
+from train_reward_yourself.train_vip_critic import VIPCritic
 
 # Import panda_gym to register Panda environments (if available)
 try:
@@ -38,6 +46,84 @@ except ImportError:
 # Suppress common warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
+def set_random_seed(seed: int):
+    """Set random seed for reproducibility across all libraries."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Make PyTorch deterministic (may reduce performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+
+def parse_normalization_stats(config_path: Path) -> Tuple[Optional[float], Optional[float]]:
+    """Parse return normalization stats from BC config file.
+
+    Returns:
+        (mean, std) tuple, or (None, None) if not found
+    """
+    if not config_path.exists():
+        return None, None
+
+    mean, std = None, None
+    with open(config_path, 'r') as f:
+        in_norm_section = False
+        for line in f:
+            line = line.strip()
+            if line == "Return Normalization:":
+                in_norm_section = True
+            elif in_norm_section:
+                if line.startswith("mean:"):
+                    mean = float(line.split(":")[1].strip())
+                elif line.startswith("std:"):
+                    std = float(line.split(":")[1].strip())
+                    break  # Found both, done
+
+    return mean, std
+
+
+class RewardStatsCallback(BaseCallback):
+    """Callback to log reward statistics from LearnedRewardWrapper."""
+
+    def __init__(self, reward_wrapper, log_freq: int = 1000, verbose: int = 0):
+        super().__init__(verbose)
+        self.reward_wrapper = reward_wrapper
+        self.log_freq = log_freq
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.log_freq == 0:
+            stats = self.reward_wrapper.get_stats()
+            if stats['total_steps'] > 0:
+                self.logger.record("reward/env_reward_avg", stats['avg_env_reward'])
+                self.logger.record("reward/learned_reward_avg", stats['avg_learned_reward'])
+                self.logger.record("reward/total_steps", stats['total_steps'])
+                # Reset stats after logging
+                self.reward_wrapper.reset_stats()
+        return True
+
+
+class VIPRewardStatsCallback(BaseCallback):
+    """Callback to log reward statistics from VIPRewardWrapper."""
+
+    def __init__(self, vip_wrapper, log_freq: int = 1000, verbose: int = 0):
+        super().__init__(verbose)
+        self.vip_wrapper = vip_wrapper
+        self.log_freq = log_freq
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.log_freq == 0:
+            stats = self.vip_wrapper.get_stats()
+            if stats['total_steps'] > 0:
+                self.logger.record("vip/env_reward_avg", stats['avg_env_reward'])
+                self.logger.record("vip/vip_reward_avg", stats['avg_vip_reward'])
+                self.logger.record("vip/total_steps", stats['total_steps'])
+                # Reset stats after logging
+                self.vip_wrapper.reset_stats()
+        return True
 
 
 def train_ppo(
@@ -55,6 +141,17 @@ def train_ppo(
     eval_env = None,
     eval_freq: int = 0,
     eval_episodes: int = 10,
+    critic_model = None,
+    learned_reward_ratio: float = 0.0,
+    return_mean: Optional[float] = None,
+    return_std: Optional[float] = None,
+    seed: int = 0,
+    vip_critic = None,
+    vip_expert_goals = None,
+    vip_reward_mode: str = "value",
+    vip_blend_ratio: float = 0.5,
+    vip_goal_mode: str = "episode",
+    vip_normalize: bool = True,
 ) -> PPO:
     """
     Train a PPO agent.
@@ -74,10 +171,55 @@ def train_ppo(
         eval_env: Optional evaluation environment
         eval_freq: Evaluation frequency in timesteps (0 to disable)
         eval_episodes: Number of episodes for evaluation
+        critic_model: Optional pretrained critic for learned rewards (Bellman-based)
+        learned_reward_ratio: Blend ratio for learned rewards [0, 1]
+        return_mean: Mean for denormalizing critic predictions
+        return_std: Std for denormalizing critic predictions
+        seed: Random seed for reproducibility
+        vip_critic: Optional VIP critic for goal-conditioned rewards
+        vip_expert_goals: Expert goal states for VIP
+        vip_reward_mode: VIP reward mode ("value", "td", or "blend")
+        vip_blend_ratio: Blend ratio for VIP blend mode [0, 1]
+        vip_goal_mode: Goal sampling mode ("episode" or "step")
+        vip_normalize: Whether to normalize VIP rewards
 
     Returns:
         Trained PPO model
     """
+    # Wrap environment with reward shaping (VIP or Bellman-based)
+    reward_wrapper = None
+    vip_wrapper = None
+
+    if vip_critic is not None and vip_expert_goals is not None:
+        # Use VIP rewards (goal-conditioned value function)
+        print(f"\nWrapping environment with VIP rewards")
+        print(f"  Reward mode: {vip_reward_mode}")
+        print(f"  Goal sampling: {vip_goal_mode}")
+        print(f"  Normalize: {vip_normalize}")
+        if vip_reward_mode == "blend":
+            print(f"  Blend ratio: {vip_blend_ratio:.2f}")
+        vip_wrapper = VIPRewardWrapper(
+            env,
+            vip_critic=vip_critic,
+            expert_goals=vip_expert_goals,
+            device=device,
+            reward_mode=vip_reward_mode,
+            blend_ratio=vip_blend_ratio,
+            goal_sample_mode=vip_goal_mode,
+            normalize_rewards=vip_normalize,
+        )
+        env = vip_wrapper
+    elif critic_model is not None and learned_reward_ratio > 0:
+        # Use Bellman-based learned rewards (backward compatibility)
+        print(f"\nWrapping environment with Bellman-based learned rewards (ratio={learned_reward_ratio:.2f})")
+        if return_mean is not None and return_std is not None:
+            print(f"Using return denormalization: mean={return_mean:.2f}, std={return_std:.2f}")
+        reward_wrapper = VecLearnedRewardWrapper(
+            env, critic_model, learned_reward_ratio, device,
+            return_mean=return_mean, return_std=return_std, gamma=0.99
+        )
+        env = reward_wrapper
+
     print("\n" + "="*60)
     if pretrained_model_path:
         print("Loading pretrained PPO agent...")
@@ -92,9 +234,9 @@ def train_ppo(
         print(f"Policy type: {policy_type}")
         print("="*60)
 
-        # Use standard rollout steps per environment (don't divide by n_envs)
-        # PPO needs enough steps per env to collect meaningful trajectories
-        rollout_steps_per_env = 2048
+        # Calculate rollout steps per environment to maintain total buffer size of 2048
+        # With vectorized envs, total buffer = rollout_steps_per_env * n_envs
+        rollout_steps_per_env = 2048 
 
         model = PPO(
             policy_type,
@@ -109,6 +251,7 @@ def train_ppo(
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
+            seed=seed,
         )
 
         print(f"Model created. Training on device: {model.device}")
@@ -134,6 +277,14 @@ def train_ppo(
         )
         callbacks.append(eval_callback)
         print(f"Best model will be saved to: ./best_model_{save_path}/")
+
+    # Add reward stats callback if using learned rewards
+    if reward_wrapper is not None:
+        reward_stats_callback = RewardStatsCallback(reward_wrapper, log_freq=1000)
+        callbacks.append(reward_stats_callback)
+    elif vip_wrapper is not None:
+        vip_stats_callback = VIPRewardStatsCallback(vip_wrapper, log_freq=1000)
+        callbacks.append(vip_stats_callback)
 
     callback = CallbackList(callbacks) if callbacks else None
     # Reset num_timesteps when loading pretrained model to start fresh tensorboard logs
@@ -167,6 +318,17 @@ def train_sac(
     eval_env = None,
     eval_freq: int = 0,
     eval_episodes: int = 10,
+    critic_model = None,
+    learned_reward_ratio: float = 0.0,
+    return_mean: Optional[float] = None,
+    return_std: Optional[float] = None,
+    seed: int = 0,
+    vip_critic = None,
+    vip_expert_goals = None,
+    vip_reward_mode: str = "value",
+    vip_blend_ratio: float = 0.5,
+    vip_goal_mode: str = "episode",
+    vip_normalize: bool = True,
 ) -> SAC:
     """
     Train a SAC agent.
@@ -186,10 +348,55 @@ def train_sac(
         eval_env: Optional evaluation environment
         eval_freq: Evaluation frequency in timesteps (0 to disable)
         eval_episodes: Number of episodes for evaluation
+        critic_model: Optional pretrained critic for learned rewards (Bellman-based)
+        learned_reward_ratio: Blend ratio for learned rewards [0, 1]
+        return_mean: Mean for denormalizing critic predictions
+        return_std: Std for denormalizing critic predictions
+        seed: Random seed for reproducibility
+        vip_critic: Optional VIP critic for goal-conditioned rewards
+        vip_expert_goals: Expert goal states for VIP
+        vip_reward_mode: VIP reward mode ("value", "td", or "blend")
+        vip_blend_ratio: Blend ratio for VIP blend mode [0, 1]
+        vip_goal_mode: Goal sampling mode ("episode" or "step")
+        vip_normalize: Whether to normalize VIP rewards
 
     Returns:
         Trained SAC model
     """
+    # Wrap environment with reward shaping (VIP or Bellman-based)
+    reward_wrapper = None
+    vip_wrapper = None
+
+    if vip_critic is not None and vip_expert_goals is not None:
+        # Use VIP rewards (goal-conditioned value function)
+        print(f"\nWrapping environment with VIP rewards")
+        print(f"  Reward mode: {vip_reward_mode}")
+        print(f"  Goal sampling: {vip_goal_mode}")
+        print(f"  Normalize: {vip_normalize}")
+        if vip_reward_mode == "blend":
+            print(f"  Blend ratio: {vip_blend_ratio:.2f}")
+        vip_wrapper = VIPRewardWrapper(
+            env,
+            vip_critic=vip_critic,
+            expert_goals=vip_expert_goals,
+            device=device,
+            reward_mode=vip_reward_mode,
+            blend_ratio=vip_blend_ratio,
+            goal_sample_mode=vip_goal_mode,
+            normalize_rewards=vip_normalize,
+        )
+        env = vip_wrapper
+    elif critic_model is not None and learned_reward_ratio > 0:
+        # Use Bellman-based learned rewards (backward compatibility)
+        print(f"\nWrapping environment with Bellman-based learned rewards (ratio={learned_reward_ratio:.2f})")
+        if return_mean is not None and return_std is not None:
+            print(f"Using return denormalization: mean={return_mean:.2f}, std={return_std:.2f}")
+        reward_wrapper = VecLearnedRewardWrapper(
+            env, critic_model, learned_reward_ratio, device,
+            return_mean=return_mean, return_std=return_std, gamma=0.99
+        )
+        env = reward_wrapper
+
     print("\n" + "="*60)
     if pretrained_model_path:
         print("Loading pretrained SAC agent...")
@@ -218,6 +425,7 @@ def train_sac(
             gamma=0.99,
             train_freq=1,
             gradient_steps=1,
+            seed=seed,
         )
 
         print(f"Model created. Training on device: {model.device}")
@@ -242,6 +450,14 @@ def train_sac(
         )
         callbacks.append(eval_callback)
         print(f"Best model will be saved to: ./best_model_{save_path}/")
+
+    # Add reward stats callback if using learned rewards
+    if reward_wrapper is not None:
+        reward_stats_callback = RewardStatsCallback(reward_wrapper, log_freq=1000)
+        callbacks.append(reward_stats_callback)
+    elif vip_wrapper is not None:
+        vip_stats_callback = VIPRewardStatsCallback(vip_wrapper, log_freq=1000)
+        callbacks.append(vip_stats_callback)
 
     callback = CallbackList(callbacks) if callbacks else None
     # Reset num_timesteps when loading pretrained model to start fresh tensorboard logs
@@ -312,8 +528,14 @@ Examples:
   # Train with periodic evaluation every 10k timesteps
   python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo ppo --timesteps 500000 --eval-freq 10000
 
-  # Train from BC-pretrained model with evaluation
-  python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo ppo --pretrain-model test.zip --timesteps 100000 --eval-freq 5000
+  # Train from BC-pretrained model
+  python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo ppo --pretrain-model experiments/run_001 --timesteps 100000
+
+  # Train with Bellman-based learned rewards from pretrained critic (50% blend)
+  python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo ppo --pretrain-model experiments/run_001 --critic-model experiments/run_001/ppo_init.zip --learned-reward-ratio 0.5 --timesteps 500000
+
+  # Train with VIP (goal-conditioned) rewards
+  python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo ppo --use-vip-rewards --vip-critic vip_critic_output/vip_critic.pt --vip-demos demos_lunarlander_v3_state.hdf5 --vip-reward-mode value --timesteps 500000
 
   # Train SAC on LunarLander with fewer parallel environments
   python train_rl_agent.py --env-type gym --env-name LunarLander-v3 --algo sac --timesteps 500000 --n-envs 1
@@ -353,7 +575,7 @@ Examples:
     parser.add_argument('--batch-size', type=int, default=None,
                         help='Batch size (default: 64 for PPO, 256 for SAC)')
     parser.add_argument('--pretrain-model', type=str, default=None,
-                        help='Path to pretrained model to load (e.g., test.zip)')
+                        help='Path to BC pretrain folder (e.g., experiments/run_001)')
     parser.add_argument('--seed', type=int, default=0,
                         help='Random seed (default: 0)')
 
@@ -373,7 +595,42 @@ Examples:
     parser.add_argument('--no-render', action='store_true',
                         help='Disable rendering during final evaluation')
 
+    # Learned reward arguments (Bellman-based)
+    parser.add_argument('--critic-model', type=str, default=None,
+                        help='Path to pretrained critic model zip file for learned rewards')
+    parser.add_argument('--learned-reward-ratio', type=float, default=0.0,
+                        help='Blend ratio for learned rewards [0, 1]. 0=env only, 1=learned only (default: 0.0)')
+
+    # VIP reward arguments
+    parser.add_argument('--use-vip-rewards', action='store_true',
+                        help='Use VIP (goal-conditioned) rewards instead of Bellman-based rewards')
+    parser.add_argument('--vip-critic', type=str, default=None,
+                        help='Path to trained VIP critic checkpoint (.pt file)')
+    parser.add_argument('--vip-demos', type=str, default=None,
+                        help='Path to expert demonstrations HDF5 file for goal extraction')
+    parser.add_argument('--vip-reward-mode', type=str, default='value',
+                        choices=['value', 'td', 'blend'],
+                        help='VIP reward mode: "value" (V(s,g)), "td" (temporal difference), "blend" (mix with env) (default: value)')
+    parser.add_argument('--vip-blend-ratio', type=float, default=0.5,
+                        help='Blend ratio for VIP blend mode [0, 1] (default: 0.5)')
+    parser.add_argument('--vip-goal-mode', type=str, default='episode',
+                        choices=['episode', 'step'],
+                        help='Goal sampling mode: "episode" (per episode) or "step" (per step) (default: episode)')
+    parser.add_argument('--vip-goal-sample', type=str, default='final',
+                        choices=['final', 'random', 'all'],
+                        help='Goal extraction mode from demos: "final" (last state), "random", "all" (default: final)')
+    parser.add_argument('--vip-n-demos', type=int, default=100,
+                        help='Number of demos to use for goal extraction (default: 100)')
+    parser.add_argument('--vip-single-goal', action='store_true',
+                        help='Use single best goal instead of multiple goals (more efficient)')
+    parser.add_argument('--vip-no-normalize', action='store_true',
+                        help='Disable VIP reward normalization')
+
     args = parser.parse_args()
+
+    # Set random seed for reproducibility
+    set_random_seed(args.seed)
+    print(f"Random seed set to: {args.seed}")
 
     # Force CPU for MlpPolicy (faster than GPU for small networks)
     device = "cpu" if args.algo == 'ppo' and not args.use_image_obs else "cuda"
@@ -422,17 +679,29 @@ Examples:
     print(f"Learning rate: {args.learning_rate}")
     print(f"Batch size: {args.batch_size}")
     if args.pretrain_model:
-        print(f"Pretrained model: {args.pretrain_model}")
+        print(f"BC pretrain folder: {args.pretrain_model}")
+    if args.critic_model:
+        print(f"Critic model: {args.critic_model}")
+        print(f"Learned reward ratio: {args.learned_reward_ratio:.2f}")
+    if args.use_vip_rewards:
+        print(f"VIP Rewards: ENABLED")
+        print(f"  VIP critic: {args.vip_critic}")
+        print(f"  VIP demos: {args.vip_demos}")
+        print(f"  Reward mode: {args.vip_reward_mode}")
+        print(f"  Goal sampling: {args.vip_goal_mode}")
+        if args.vip_reward_mode == "blend":
+            print(f"  Blend ratio: {args.vip_blend_ratio:.2f}")
     if args.eval_freq > 0:
         print(f"Evaluation frequency: Every {args.eval_freq:,} timesteps ({args.eval_episodes} episodes)")
     print(f"Random seed: {args.seed}")
     print(f"Device: {device}")
     print("="*60 + "\n")
 
-    # Create save paths
+    # Create save paths with timestamp for unique runs
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     obs_type = "img" if args.use_image_obs else "state"
-    save_path = f"{args.algo}_{args.env_name.lower().replace('-', '_')}_{obs_type}_{args.timesteps}"
-    tensorboard_log = f"./{args.algo}_{args.env_name.lower().replace('-', '_')}_{obs_type}_tensorboard/"
+    save_path = f"{args.algo}_{args.env_name.lower().replace('-', '_')}_{obs_type}_{args.timesteps}_{timestamp}"
+    tensorboard_log = f"./{args.algo}_{args.env_name.lower().replace('-', '_')}_{obs_type}_tb/{timestamp}/"
     print(f"Model will be saved to: {save_path}.zip")
     print(f"Tensorboard logs will be saved to: {tensorboard_log}\n")
 
@@ -464,6 +733,117 @@ Examples:
         print(f"Creating evaluation environment for periodic evaluation...")
         eval_env = env_config.create_single_env()
 
+    # Handle BC pretrain folder path
+    ppo_init_path = None
+    critic_model = None
+    return_mean, return_std = None, None
+
+    if args.pretrain_model is not None:
+        pretrain_dir = Path(args.pretrain_model)
+        if not pretrain_dir.exists():
+            raise ValueError(f"Pretrain folder not found: {pretrain_dir}")
+
+        # Load policy initialization model
+        ppo_init_path = pretrain_dir / "ppo_init.zip"
+        if not ppo_init_path.exists():
+            raise ValueError(f"PPO init model not found: {ppo_init_path}")
+
+        print(f"\nLoading pretrained policy from: {ppo_init_path}")
+
+        # Parse normalization stats from config if available
+        config_path = pretrain_dir / "config.txt"
+        return_mean, return_std = parse_normalization_stats(config_path)
+
+    # Load critic model if provided
+    if args.critic_model is not None:
+        critic_model_path = Path(args.critic_model)
+        if not critic_model_path.exists():
+            raise ValueError(f"Critic model not found: {critic_model_path}")
+
+        print(f"\nLoading critic model from: {critic_model_path}")
+        if args.algo == 'ppo':
+            critic_model = PPO.load(str(critic_model_path), device=device)
+        else:
+            critic_model = SAC.load(str(critic_model_path), device=device)
+
+        # Use normalization stats from pretrain config if available
+        if return_mean is not None and return_std is not None:
+            print(f"Using return normalization: mean={return_mean:.2f}, std={return_std:.2f}")
+        else:
+            print("Warning: No return normalization stats available")
+
+        print(f"Critic model loaded. Learned reward ratio: {args.learned_reward_ratio:.2f}")
+
+    # Load VIP critic and extract expert goals if using VIP rewards
+    vip_critic_loaded = None
+    vip_expert_goals = None
+
+    if args.use_vip_rewards:
+        if args.vip_critic is None:
+            raise ValueError("--use-vip-rewards requires --vip-critic")
+
+        vip_critic_path = Path(args.vip_critic)
+
+        if not vip_critic_path.exists():
+            raise ValueError(f"VIP critic not found: {vip_critic_path}")
+
+        print(f"\n{'='*60}")
+        print("Loading VIP critic...")
+        print(f"{'='*60}")
+
+        # Load VIP critic checkpoint
+        checkpoint = torch.load(str(vip_critic_path), map_location=device)
+        use_learned_goal = checkpoint.get("use_learned_goal", False)
+
+        # Create environment to get observation space
+        temp_env = gym.make(args.env_name)
+
+        vip_critic_loaded = VIPCritic(
+            observation_space=temp_env.observation_space,
+            obs_type=checkpoint.get("obs_type", "state"),
+            features_dim=checkpoint.get("features_dim", 256),
+            use_learned_goal=use_learned_goal,
+        ).to(device)
+        vip_critic_loaded.load_state_dict(checkpoint["model_state_dict"])
+        vip_critic_loaded.eval()
+        temp_env.close()
+
+        print(f"VIP critic loaded from: {vip_critic_path}")
+
+        # Extract expert goals (only if not using learned goal)
+        if use_learned_goal:
+            print("VIP critic uses learned goal embedding - no need to extract expert goals!")
+            vip_expert_goals = None
+        else:
+            if args.vip_demos is None:
+                raise ValueError("--vip-demos required when VIP critic doesn't use learned goal embedding")
+
+            vip_demos_path = Path(args.vip_demos)
+            if not vip_demos_path.exists():
+                raise ValueError(f"VIP demos not found: {vip_demos_path}")
+
+            print("Extracting expert goals...")
+            obs_type = "image" if args.use_image_obs else "state"
+            vip_expert_goals = extract_expert_goals(
+                hdf5_path=str(vip_demos_path),
+                n_demos=args.vip_n_demos,
+                obs_type=obs_type,
+                sample_mode=args.vip_goal_sample,
+                use_single_goal=args.vip_single_goal,
+            )
+            if args.vip_single_goal:
+                print(f"Using single canonical goal (best final state)")
+            else:
+                print(f"Extracted {len(vip_expert_goals)} expert goals")
+
+        print(f"VIP configuration:")
+        print(f"  Reward mode: {args.vip_reward_mode}")
+        if not use_learned_goal:
+            print(f"  Goal sampling: {args.vip_goal_mode}")
+        print(f"  Normalize: {not args.vip_no_normalize}")
+        if args.vip_reward_mode == "blend":
+            print(f"  Blend ratio: {args.vip_blend_ratio:.2f}")
+
     # Train the agent
     if args.algo == 'ppo':
         model = train_ppo(
@@ -476,10 +856,21 @@ Examples:
             policy_type=policy_type,
             learning_rate=args.learning_rate,
             batch_size=args.batch_size,
-            pretrained_model_path=args.pretrain_model,
+            pretrained_model_path=str(ppo_init_path) if ppo_init_path else None,
             eval_env=eval_env,
             eval_freq=args.eval_freq,
             eval_episodes=args.eval_episodes,
+            critic_model=critic_model,
+            learned_reward_ratio=args.learned_reward_ratio,
+            return_mean=return_mean,
+            return_std=return_std,
+            seed=args.seed,
+            vip_critic=vip_critic_loaded,
+            vip_expert_goals=vip_expert_goals,
+            vip_reward_mode=args.vip_reward_mode,
+            vip_blend_ratio=args.vip_blend_ratio,
+            vip_goal_mode=args.vip_goal_mode,
+            vip_normalize=not args.vip_no_normalize,
         )
     elif args.algo == 'sac':
         model = train_sac(
@@ -493,10 +884,21 @@ Examples:
             buffer_size=args.buffer_size,
             learning_starts=args.learning_starts,
             batch_size=args.batch_size,
-            pretrained_model_path=args.pretrain_model,
+            pretrained_model_path=str(ppo_init_path) if ppo_init_path else None,
             eval_env=eval_env,
             eval_freq=args.eval_freq,
             eval_episodes=args.eval_episodes,
+            critic_model=critic_model,
+            learned_reward_ratio=args.learned_reward_ratio,
+            return_mean=return_mean,
+            return_std=return_std,
+            seed=args.seed,
+            vip_critic=vip_critic_loaded,
+            vip_expert_goals=vip_expert_goals,
+            vip_reward_mode=args.vip_reward_mode,
+            vip_blend_ratio=args.vip_blend_ratio,
+            vip_goal_mode=args.vip_goal_mode,
+            vip_normalize=not args.vip_no_normalize,
         )
 
     # Close evaluation environment if it was created

@@ -33,6 +33,8 @@ Usage:
 """
 
 import argparse
+import os
+import random
 import h5py
 import numpy as np
 import torch
@@ -43,11 +45,125 @@ from pathlib import Path
 from typing import Tuple, Dict, List, Optional
 from tqdm import tqdm
 import gymnasium as gym
-import cv2 
+import cv2
+import matplotlib.pyplot as plt
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.policies import ActorCriticPolicy
+
+
+def set_random_seed(seed: int):
+    """Set random seed for reproducibility across all libraries."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+
+def plot_episode_returns(
+    hdf5_path: str,
+    n_demos: int,
+    gamma: float,
+    save_path: str,
+) -> Dict[str, float]:
+    """Plot ground truth value progression over time steps for each episode.
+
+    Args:
+        hdf5_path: Path to HDF5 demonstrations
+        n_demos: Number of demonstrations to analyze
+        gamma: Discount factor for return calculation
+        save_path: Path to save the plot
+
+    Returns:
+        Dictionary with statistics (mean, std, min, max) of initial returns
+    """
+    all_episode_values = []  # List of arrays, one per episode
+    initial_returns = []  # G_0 for each episode
+
+    with h5py.File(hdf5_path, "r") as f:
+        print(f"\nComputing ground truth value progression for {n_demos} episodes...")
+
+        for i in tqdm(range(n_demos), desc="Computing returns"):
+            ep_key = f"demo_{i}"
+            if ep_key not in f["data"]:
+                print(f"Warning: Episode {ep_key} not found, skipping")
+                continue
+
+            ep_grp = f[f"data/{ep_key}"]
+            rewards = np.array(ep_grp["rewards"])
+
+            # Compute discounted return at each time step: G_t
+            returns = np.zeros_like(rewards)
+            running_return = 0.0
+            for t in reversed(range(len(rewards))):
+                running_return = rewards[t] + gamma * running_return
+                returns[t] = running_return
+
+            all_episode_values.append(returns)
+            initial_returns.append(returns[0])
+
+    initial_returns = np.array(initial_returns)
+
+    # Compute statistics on initial returns
+    stats = {
+        "mean": float(np.mean(initial_returns)),
+        "std": float(np.std(initial_returns)),
+        "min": float(np.min(initial_returns)),
+        "max": float(np.max(initial_returns)),
+    }
+
+    # Create visualization
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Panel 1: Value progression over time steps (N lines, one per episode)
+    for i, values in enumerate(all_episode_values):
+        ax1.plot(range(len(values)), values, alpha=0.6, linewidth=1.5)
+
+    ax1.set_xlabel("Time Step", fontsize=12)
+    ax1.set_ylabel("Ground Truth Value V(s_t) = G_t", fontsize=12)
+    ax1.set_title(f"Value Function Progression (γ={gamma}, n={len(all_episode_values)} episodes)",
+                  fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+
+    # Add statistics text box
+    stats_text = f"Initial Return (G_0) Stats:\n"
+    stats_text += f"μ={stats['mean']:.2f}\n"
+    stats_text += f"σ={stats['std']:.2f}\n"
+    stats_text += f"min={stats['min']:.2f}\n"
+    stats_text += f"max={stats['max']:.2f}"
+    ax1.text(0.02, 0.98, stats_text,
+             transform=ax1.transAxes,
+             fontsize=10,
+             verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    # Panel 2: Distribution of initial returns (G_0)
+    ax2.hist(initial_returns, bins=20, alpha=0.7, edgecolor='black')
+    ax2.axvline(stats['mean'], color='red', linestyle='--',
+                linewidth=2, label=f"Mean: {stats['mean']:.2f}")
+    ax2.set_xlabel("Initial Ground Truth Value (G_0)", fontsize=12)
+    ax2.set_ylabel("Frequency", fontsize=12)
+    ax2.set_title("Distribution of Episode Initial Returns", fontsize=14, fontweight='bold')
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"\nGround Truth Value Statistics:")
+    print(f"  Episodes: {len(all_episode_values)}")
+    print(f"  Initial Return (G_0) Mean: {stats['mean']:.2f}")
+    print(f"  Initial Return (G_0) Std:  {stats['std']:.2f}")
+    print(f"  Initial Return (G_0) Min:  {stats['min']:.2f}")
+    print(f"  Initial Return (G_0) Max:  {stats['max']:.2f}")
+    print(f"  Saved plot to: {save_path}")
+
+    return stats
 
 
 class ImageObservationWrapper(gym.ObservationWrapper):
@@ -297,7 +413,6 @@ class CNNFeatureExtractor(BaseFeaturesExtractor):
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Dropout(0.3),  # Add dropout to reduce overfitting
         )
 
         # Compute shape by doing one forward pass
@@ -345,6 +460,9 @@ class BCAgent(nn.Module):
         obs_type: str = "state",
         features_dim: int = 256,
         train_value_head: bool = False,
+        value_bins: int = 0,
+        value_min: float = -300.0,
+        value_max: float = 300.0,
     ):
         super().__init__()
 
@@ -352,6 +470,8 @@ class BCAgent(nn.Module):
         self.action_space = action_space
         self.is_discrete = isinstance(action_space, gym.spaces.Discrete)
         self.train_value_head = train_value_head
+        self.value_bins = value_bins
+        self.use_categorical_value = value_bins > 0
 
         # Feature extractor
         if obs_type == "image":
@@ -367,17 +487,73 @@ class BCAgent(nn.Module):
 
         # Value head (optional, for critic pretraining)
         if train_value_head:
-            self.value_head = nn.Linear(features_dim, 1)
+            if self.use_categorical_value:
+                # Categorical value distribution (classification)
+                self.value_head = nn.Linear(features_dim, value_bins)
+                # Create bin centers for value computation
+                self.register_buffer(
+                    "value_bin_centers",
+                    torch.linspace(value_min, value_max, value_bins)
+                )
+            else:
+                # Scalar value (regression)
+                self.value_head = nn.Linear(features_dim, 1)
 
     def forward(self, obs, return_value=False):
         features = self.feature_extractor(obs)
         action_logits = self.action_head(features)
 
         if return_value and self.train_value_head:
-            value = self.value_head(features)
-            return action_logits, value
+            value_output = self.value_head(features)
+            return action_logits, value_output
 
         return action_logits
+
+    def discretize_values(self, continuous_values: torch.Tensor) -> torch.Tensor:
+        """Convert continuous return values to discrete bin indices.
+
+        Args:
+            continuous_values: Continuous return values (B,) or (B, 1)
+
+        Returns:
+            Bin indices (B,) as long tensor
+        """
+        if not self.use_categorical_value:
+            raise ValueError("discretize_values only works with categorical value heads")
+
+        values = continuous_values.squeeze(-1)  # (B,)
+        # Compute bin boundaries (midpoints between centers)
+        bin_edges = (self.value_bin_centers[:-1] + self.value_bin_centers[1:]) / 2
+        # Add edges for first and last bins
+        bin_edges = torch.cat([
+            torch.tensor([float('-inf')], device=bin_edges.device),
+            bin_edges,
+            torch.tensor([float('inf')], device=bin_edges.device)
+        ])
+
+        # Digitize: find which bin each value belongs to
+        indices = torch.searchsorted(bin_edges, values, right=False) - 1
+        indices = torch.clamp(indices, 0, self.value_bins - 1)
+
+        return indices
+
+    def compute_expected_value(self, value_logits: torch.Tensor) -> torch.Tensor:
+        """Compute expected value from categorical distribution.
+
+        Args:
+            value_logits: Logits over value bins (B, num_bins)
+
+        Returns:
+            Expected values (B, 1)
+        """
+        if not self.use_categorical_value:
+            raise ValueError("compute_expected_value only works with categorical value heads")
+
+        # Softmax to get probabilities
+        probs = F.softmax(value_logits, dim=-1)  # (B, num_bins)
+        # Compute expectation
+        expected = (probs * self.value_bin_centers).sum(dim=-1, keepdim=True)  # (B, 1)
+        return expected
 
     def predict(self, obs, deterministic=True):
         """Predict action from observation (compatible with SB3 interface)."""
@@ -419,36 +595,56 @@ def train_bc_agent(
     device: torch.device,
     value_loss_coef: float = 0.5,
     weight_decay: float = 1e-4,
-) -> Dict[str, List[float]]:
+) -> Tuple[Dict[str, List[float]], Optional[Tuple[float, float]]]:
     """Train the BC agent."""
 
     optimizer = torch.optim.Adam(agent.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
 
+    # Compute return normalization stats if training value head (for regression only)
+    return_mean = None
+    return_std = None
+    if agent.train_value_head and not agent.use_categorical_value:
+        all_returns = []
+        for batch in train_loader:
+            _, _, returns = batch
+            all_returns.append(returns)
+        all_returns = torch.cat(all_returns)
+        return_mean = all_returns.mean()
+        return_std = all_returns.std() + 1e-8
+        print(f"Return normalization: mean={return_mean:.2f}, std={return_std:.2f}")
+    elif agent.train_value_head and agent.use_categorical_value:
+        print(f"Using categorical value head with {agent.value_bins} bins")
+        print(f"Value range: [{agent.value_bin_centers.min().item():.2f}, {agent.value_bin_centers.max().item():.2f}]")
+
     # Compute class weights from training data
     class_weights = None
     if agent.is_discrete:
-        # Collect all actions from training set
-        all_actions = []
-        for batch in train_loader:
-            if len(batch) == 3:  # with returns
-                _, actions, _ = batch
-            else:
-                _, actions = batch
-            all_actions.append(actions)
-        all_actions = torch.cat(all_actions)
+        # # Collect all actions from training set
+        # all_actions = []
+        # for batch in train_loader:
+        #     if len(batch) == 3:  # with returns
+        #         _, actions, _ = batch
+        #     else:
+        #         _, actions = batch
+        #     all_actions.append(actions)
+        # all_actions = torch.cat(all_actions)
 
-        # Compute inverse frequency weights
-        unique, counts = torch.unique(all_actions, return_counts=True)
-        class_weights = len(all_actions) / (len(unique) * counts.float())
-        class_weights = class_weights.to(device)
-        print(f"Class weights: {class_weights}")
+        # # Compute inverse frequency weights
+        # unique, counts = torch.unique(all_actions, return_counts=True)
+        # class_weights = len(all_actions) / (len(unique) * counts.float())
+        # class_weights = class_weights.to(device)
+        # print(f"Class weights: {class_weights}")
 
         policy_criterion = nn.CrossEntropyLoss(weight=class_weights)
     else:
         policy_criterion = nn.MSELoss()
 
-    value_criterion = nn.MSELoss()
+    # Value criterion depends on whether we're using categorical or regression
+    if agent.use_categorical_value:
+        value_criterion = nn.CrossEntropyLoss()
+    else:
+        value_criterion = nn.HuberLoss(delta=1.0)
 
     history = {
         "train_loss": [], "val_loss": [],
@@ -472,7 +668,15 @@ def train_bc_agent(
                 obs, actions, returns = batch
                 obs = obs.to(device)
                 actions = actions.to(device)
-                returns = returns.to(device).unsqueeze(-1)
+                returns = returns.to(device)
+
+                if agent.use_categorical_value:
+                    # Discretize returns into bin indices for classification
+                    value_targets = agent.discretize_values(returns)  # (B,) long tensor
+                else:
+                    # Normalize returns for regression
+                    returns = returns.unsqueeze(-1)
+                    value_targets = (returns - return_mean) / return_std
             else:
                 obs, actions = batch
                 obs = obs.to(device)
@@ -481,9 +685,9 @@ def train_bc_agent(
             optimizer.zero_grad()
 
             if agent.train_value_head:
-                predictions, values = agent(obs, return_value=True)
+                predictions, value_output = agent(obs, return_value=True)
                 policy_loss = policy_criterion(predictions, actions) if not agent.is_discrete or predictions.dim() > 1 else policy_criterion(predictions, actions)
-                value_loss = value_criterion(values, returns)
+                value_loss = value_criterion(value_output, value_targets)
                 loss = policy_loss + value_loss_coef * value_loss
             else:
                 predictions = agent(obs)
@@ -542,16 +746,24 @@ def train_bc_agent(
                         obs, actions, returns = batch
                         obs = obs.to(device)
                         actions = actions.to(device)
-                        returns = returns.to(device).unsqueeze(-1)
+                        returns = returns.to(device)
+
+                        if agent.use_categorical_value:
+                            # Discretize returns into bin indices for classification
+                            value_targets = agent.discretize_values(returns)
+                        else:
+                            # Normalize returns for regression
+                            returns = returns.unsqueeze(-1)
+                            value_targets = (returns - return_mean) / return_std
                     else:
                         obs, actions = batch
                         obs = obs.to(device)
                         actions = actions.to(device)
 
                     if agent.train_value_head:
-                        predictions, values = agent(obs, return_value=True)
+                        predictions, value_output = agent(obs, return_value=True)
                         policy_loss = policy_criterion(predictions, actions)
-                        value_loss = value_criterion(values, returns)
+                        value_loss = value_criterion(value_output, value_targets)
                         loss = policy_loss + value_loss_coef * value_loss
                     else:
                         predictions = agent(obs)
@@ -593,10 +805,12 @@ def train_bc_agent(
         else:
             scheduler.step(avg_train_loss)
 
-    return history
+    # Return normalization stats along with history
+    norm_stats = (return_mean.item(), return_std.item()) if return_mean is not None else None
+    return history, norm_stats
 
 
-def evaluate_bc_agent(agent: BCAgent, env: gym.Env, num_episodes: int = 10, save_debug: bool = False) -> Dict[str, float]:
+def evaluate_bc_agent(agent: BCAgent, env: gym.Env, num_episodes: int = 10, save_debug: bool = False, debug_dir: Optional[Path] = None) -> Dict[str, float]:
     """Evaluate the BC agent in the environment."""
 
     agent.eval()
@@ -620,8 +834,9 @@ def evaluate_bc_agent(agent: BCAgent, env: gym.Env, num_episodes: int = 10, save
                 if obs_img.shape[0] > 3:
                     obs_img = obs_img[:3]  # Take first 3 channels
                 obs_img = np.transpose(obs_img, (1, 2, 0))
-                plt.imsave("debug_eval_sample.png", np.clip(obs_img, 0, 1))
-                print(f"Saved eval sample to debug_eval_sample.png")
+                save_path = "debug_eval_sample.png" if debug_dir is None else str(debug_dir / "eval_sample.png")
+                plt.imsave(save_path, np.clip(obs_img, 0, 1))
+                print(f"Saved eval sample to {save_path}")
 
         while not done:
             action, _ = agent.predict(obs, deterministic=True)
@@ -690,10 +905,15 @@ def save_bc_model_for_ppo(
                 ppo_state_dict[ppo_key] = bc_state_dict[bc_key]
                 transferred.append(f"{bc_key} -> {ppo_key}")
         elif "value_head" in bc_key and agent.train_value_head:
-            ppo_key = bc_key.replace("value_head", "value_net")
-            if ppo_key in ppo_state_dict:
-                ppo_state_dict[ppo_key] = bc_state_dict[bc_key]
-                transferred.append(f"{bc_key} -> {ppo_key}")
+            # Only transfer value head weights if not using categorical (PPO expects scalar)
+            if not agent.use_categorical_value:
+                ppo_key = bc_key.replace("value_head", "value_net")
+                if ppo_key in ppo_state_dict:
+                    ppo_state_dict[ppo_key] = bc_state_dict[bc_key]
+                    transferred.append(f"{bc_key} -> {ppo_key}")
+            else:
+                # Categorical value head not compatible with PPO - skip transfer
+                print(f"  Skipping {bc_key} (categorical value head not compatible with PPO's scalar value head)")
 
     ppo_model.policy.load_state_dict(ppo_state_dict, strict=False)
     ppo_model.save(save_path)
@@ -714,8 +934,8 @@ def main():
                         help="Path to HDF5 demonstration file")
     parser.add_argument("--obs-type", type=str, default="state", choices=["state", "image"],
                         help="Observation type (state or image)")
-    parser.add_argument("--frame-stack", type=int, default=4,
-                        help="Number of frames to stack for temporal info (default: 4)")
+    parser.add_argument("--frame-stack", type=int, default=1,
+                        help="Number of frames to stack for temporal info (default: 1)")
     parser.add_argument("--train-split", type=float, default=0.9,
                         help="Fraction of data for training (default: 0.9)")
 
@@ -734,8 +954,8 @@ def main():
                         help="Number of training epochs (default: 100)")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate (default: 1e-3)")
-    parser.add_argument("--weight-decay", type=float, default=1e-4,
-                        help="Weight decay for regularization (default: 1e-4)")
+    parser.add_argument("--weight-decay", type=float, default=0.0,
+                        help="Weight decay for regularization (default: 0.0)")
     parser.add_argument("--features-dim", type=int, default=256,
                         help="Feature dimension (default: 256)")
 
@@ -746,9 +966,15 @@ def main():
                         help="Discount factor for return calculation (default: 0.99)")
     parser.add_argument("--value-loss-coef", type=float, default=0.5,
                         help="Coefficient for value loss (default: 0.5)")
+    parser.add_argument("--value-bins", type=int, default=0,
+                        help="Number of bins for categorical value head (0=regression, >0=classification, default: 0)")
+    parser.add_argument("--value-min", type=float, default=-300.0,
+                        help="Minimum value for binning (default: -300.0)")
+    parser.add_argument("--value-max", type=float, default=300.0,
+                        help="Maximum value for binning (default: 300.0)")
 
     # Evaluation arguments
-    parser.add_argument("--eval-episodes", type=int, default=10,
+    parser.add_argument("--eval-episodes", type=int, default=30,
                         help="Number of episodes for evaluation (default: 10)")
     parser.add_argument("--no-eval", action="store_true",
                         help="Skip evaluation after training")
@@ -756,10 +982,18 @@ def main():
     # Output arguments
     parser.add_argument("--output", type=str, required=True,
                         help="Output path for trained model (.zip)")
+    parser.add_argument("--plot-returns", action="store_true",
+                        help="Plot ground truth episode returns from dataset")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device (cpu/cuda/auto, default: auto)")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Random seed for reproducibility (default: 0)")
 
     args = parser.parse_args()
+
+    # Set random seed for reproducibility
+    set_random_seed(args.seed)
+    print(f"Random seed set to: {args.seed}")
 
     # Set device
     if args.device == "auto":
@@ -795,26 +1029,50 @@ def main():
     train_size = int(args.train_split * len(full_dataset))
     val_size = len(full_dataset) - train_size
 
+    # Use a generator with fixed seed for reproducible splits
+    generator = torch.Generator().manual_seed(args.seed)
     train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size]
+        full_dataset, [train_size, val_size], generator=generator
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False) if val_size > 0 else None
+    # Worker init function for reproducibility
+    def worker_init_fn(worker_id):
+        worker_seed = args.seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        worker_init_fn=worker_init_fn, generator=generator
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        worker_init_fn=worker_init_fn
+    ) if val_size > 0 else None
 
     print(f"Train samples: {train_size}, Val samples: {val_size}")
 
-    # DEBUG: Save sample training image
-    if args.obs_type == "image":
-        import matplotlib.pyplot as plt
-        sample_obs, _ = train_dataset[0]
-        sample_img = sample_obs.numpy()
-        # Take first 3 channels if stacked
-        if sample_img.shape[0] > 3:
-            sample_img = sample_img[:3]
-        sample_img = np.transpose(sample_img, (1, 2, 0))
-        plt.imsave("debug_train_sample.png", np.clip(sample_img, 0, 1))
-        print(f"Saved training sample to debug_train_sample.png")
+    # Plot episode returns if requested
+    if args.plot_returns:
+        print("\n" + "="*60)
+        print("Plotting ground truth episode returns...")
+        print("="*60)
+
+        # Determine output directory
+        output_path = Path(args.output)
+        if output_path.suffix in [".zip", ".pt"]:
+            output_dir = output_path.with_suffix("")
+        else:
+            output_dir = output_path
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        plot_path = output_dir / "episode_returns.png"
+        plot_episode_returns(
+            hdf5_path=args.data,
+            n_demos=args.n_demos,
+            gamma=args.gamma,
+            save_path=str(plot_path),
+        )
 
     # Create environment for evaluation
     if args.env_type == "gym":
@@ -828,6 +1086,10 @@ def main():
             env = ImageObservationWrapper(env, target_shape=target_hw, frame_stack=frame_stack, normalize=True)
         else:
             env = gym.make(args.env_name)
+
+        # Seed the environment for reproducibility
+        env.action_space.seed(args.seed)
+        env.observation_space.seed(args.seed)
     else:
         raise NotImplementedError("Robosuite environments not yet supported")
 
@@ -859,6 +1121,9 @@ def main():
         obs_type=args.obs_type,
         features_dim=args.features_dim,
         train_value_head=args.pretrain_critic,
+        value_bins=args.value_bins,
+        value_min=args.value_min,
+        value_max=args.value_max,
     ).to(device)
 
     print(f"Agent architecture:")
@@ -869,7 +1134,31 @@ def main():
     print("Training BC agent...")
     print("="*60)
 
-    history = train_bc_agent(
+    # Create output directory first
+    output_path = Path(args.output)
+    if output_path.suffix in [".zip", ".pt"]:
+        # If user provided a file path, create a directory with that name
+        output_dir = output_path.with_suffix("")
+    else:
+        # If user provided a directory path, use it
+        output_dir = output_path
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nOutput directory: {output_dir}")
+
+    # Save sample training image if using images
+    # if args.obs_type == "image":
+    #     import matplotlib.pyplot as plt
+    #     sample_obs, _ = train_dataset[0]
+    #     sample_img = sample_obs.numpy()
+    #     # Take first 3 channels if stacked
+    #     if sample_img.shape[0] > 3:
+    #         sample_img = sample_img[:3]
+    #     sample_img = np.transpose(sample_img, (1, 2, 0))
+    #     plt.imsave(str(output_dir / "train_sample.png"), np.clip(sample_img, 0, 1))
+    #     print(f"Saved training sample to {output_dir / 'train_sample.png'}")
+
+    history, norm_stats = train_bc_agent(
         train_loader=train_loader,
         val_loader=val_loader,
         agent=agent,
@@ -886,11 +1175,25 @@ def main():
         print("Evaluating BC agent...")
         print("="*60)
 
-        results = evaluate_bc_agent(agent, env, num_episodes=args.eval_episodes, save_debug=(args.obs_type == "image"))
+        results = evaluate_bc_agent(
+            agent, env,
+            num_episodes=args.eval_episodes,
+            save_debug=(args.obs_type == "image"),
+            debug_dir=output_dir
+        )
 
         print(f"\nEvaluation Results ({args.eval_episodes} episodes):")
         print(f"  Mean Reward: {results['mean_reward']:.2f} ± {results['std_reward']:.2f}")
         print(f"  Mean Length: {results['mean_length']:.1f} ± {results['std_length']:.1f}")
+
+        # Save eval results
+        eval_path = output_dir / "eval_results.txt"
+        with open(eval_path, "w") as f:
+            f.write(f"Evaluation Results ({args.eval_episodes} episodes)\n")
+            f.write("=" * 60 + "\n")
+            f.write(f"Mean Reward: {results['mean_reward']:.2f} ± {results['std_reward']:.2f}\n")
+            f.write(f"Mean Length: {results['mean_length']:.1f} ± {results['std_length']:.1f}\n")
+        print(f"Saved eval results to {eval_path}")
 
     # Save model
     print("\n" + "="*60)
@@ -898,26 +1201,48 @@ def main():
     print("="*60)
 
     # Save for PPO initialization
-    save_bc_model_for_ppo(agent, env, args.output, args.obs_type, args.features_dim)
+    ppo_path = output_dir / "ppo_init.zip"
+    save_bc_model_for_ppo(agent, env, str(ppo_path), args.obs_type, args.features_dim)
 
-    # Also save BC agent directly
-    output_path = Path(args.output)
-    if output_path.suffix == ".zip":
-        bc_direct_path = output_path.with_suffix("").with_suffix(".pt")
-    else:
-        bc_direct_path = output_path.with_name(output_path.name + "_bc.pt")
-
-    torch.save({
+    # Save BC agent directly with all metadata
+    bc_path = output_dir / "bc_agent.pt"
+    checkpoint = {
         "model_state_dict": agent.state_dict(),
         "obs_type": args.obs_type,
         "features_dim": args.features_dim,
         "train_value_head": args.pretrain_critic,
+        "value_bins": args.value_bins,
+        "value_min": args.value_min,
+        "value_max": args.value_max,
         "history": history,
-    }, str(bc_direct_path))
-    print(f"Saved BC agent: {bc_direct_path}")
+    }
+
+    # Add normalization stats if critic was pretrained (only for regression)
+    if norm_stats is not None:
+        checkpoint["return_mean"] = norm_stats[0]
+        checkpoint["return_std"] = norm_stats[1]
+        print(f"Saved return normalization: mean={norm_stats[0]:.2f}, std={norm_stats[1]:.2f}")
+    elif args.pretrain_critic and args.value_bins > 0:
+        print(f"Using categorical value head - no normalization stats to save")
+
+    torch.save(checkpoint, str(bc_path))
+    print(f"Saved BC agent: {bc_path}")
+
+    # Save training config for reproducibility
+    config_path = output_dir / "config.txt"
+    with open(config_path, "w") as f:
+        f.write("Training Configuration\n")
+        f.write("=" * 60 + "\n")
+        for key, value in vars(args).items():
+            f.write(f"{key}: {value}\n")
+        if norm_stats is not None:
+            f.write(f"\nReturn Normalization:\n")
+            f.write(f"  mean: {norm_stats[0]:.6f}\n")
+            f.write(f"  std: {norm_stats[1]:.6f}\n")
+    print(f"Saved config: {config_path}")
 
     env.close()
-    print("\nTraining complete!")
+    print(f"\nTraining complete! All outputs saved to: {output_dir.absolute()}")
 
 
 if __name__ == "__main__":
